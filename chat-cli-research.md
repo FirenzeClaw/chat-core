@@ -652,3 +652,130 @@ Phase 3: 智能协调
 2. **双脑人格注入深度？** 仅 System Prompt 差异（~200 token），还是独立 persona 配置？
 3. **FLOW 触发条件？** 何时自动启用双脑 vs 单脑？方案：复杂度判定器——文件数 > 5 或用户显式 `--dual` flag。
 4. **冲突时用户交互？** diff 冲突时 CLI 如何呈现？方案：类似 `git merge` 的冲突标记 + 用户选择。
+
+---
+
+## Agent 状态机核心模式
+
+> 所有现代 AI CLI 工具的底层都是同一个状态机循环。2026-07-09 实测分析。
+
+### 通用模式
+
+```
+用户输入 → [组装上下文] → [LLM 推理] → 有工具调用?
+                                           ├─ 是 → [执行工具] → 工具结果注入上下文 → 回到组装
+                                           └─ 否 → 输出最终回复
+```
+
+这就是 Think → Act → Observe 循环。每次 LLM 推理是"无状态"的——模型不"记住"上一轮想了什么，它只能读到上下文窗口里积累的历史。维持"连续思考"的幻觉，完全靠运行时把每次工具结果追加到对话历史中。
+
+### 三种具体实现
+
+#### 1. Claude Code — 原生 Function Calling 流式循环
+
+Claude Code 的 Agent SDK 是架构最完整的实现，直接依赖 Anthropic API 的 native function calling：
+
+```
+  prompt 进入
+    │
+    ├─ 组装上下文: system prompt + tool definitions + 历史 + 当前消息
+    ├─ LLM 流式推理 (streaming SSE)
+    │    ├─ 产出 text delta → 实时渲染
+    │    └─ 产出 tool_use block → 解析工具调用
+    │
+    ├─ 有 tool_use?
+    │    ├─ 并行执行: 同轮的 Read/Glob/Grep 并发跑
+    │    │              Write/Edit/Bash 串行跑 (防冲突)
+    │    ├─ 结果注入: tool_result 消息追加到对话历史
+    │    └─ 回到组装上下文 (下一 turn)
+    │
+    └─ 无 tool_use → done → 返回 ResultMessage
+```
+
+关键设计：
+- **流式解析**：不等完整回复，tool_use block 关闭即开始工具调度
+- **并行/串行区分**：只读工具并发、写入工具串行（MCP 工具通过 readOnlyHint 标注）
+- **终止条件**：模型输出不包含任何 tool_use 即为结束；也有 max_turns / max_budget_usd 硬上限
+- **上下文压缩**：接近窗口上限时自动 compact（summarize 旧轮次），发出 compact_boundary 事件
+- **Hook 系统**：PreToolUse / PostToolUse / Stop 等 hook 可在循环各阶段拦截
+
+#### 2. aichat — 异步递归 + OpenAI Compatible API
+
+aichat (Rust) 使用 async 递归而非显式 while 循环，因为它用的是 OpenAI-compatible 而非 Anthropic 原生 function calling：
+
+```rust
+// 核心: ask() 函数标记 #[async_recursion]
+async fn ask(input, with_embeddings) {
+    // 1. 组装上下文 (messages + RAG + tool definitions)
+    // 2. 调用 LLM (streaming 或非 streaming)
+    let output = client.chat_completions(messages).await;
+    //     output = (text, Vec<ToolResult>)
+
+    // 3. 如果有工具调用结果 → 递归
+    if !output.tool_results.is_empty() {
+        let new_input = input.merge_tool_results(output);  // 合并工具结果到消息
+        return ask(new_input, false).await;  // 递归调用自己
+    }
+
+    // 4. 没有工具调用 → 终止
+    session.maintain();  // 自动命名/压缩 session
+}
+```
+
+关键差异：
+- **递归而非循环**：利用函数调用栈自然维护状态，不需要手动管理 while 条件
+- **不需要 native function calling**：LLM 返回 JSON 文本，由 parse_json_block 解析。能用原生 tool_call 的 provider（OpenAI/Anthropic）走 eval_tool_calls 路径
+- **RAG 只在首轮**：递归时 with_embeddings=false，避免重复检索
+- **Session 压缩检查**：递归前等待压缩完成（wait_for_compression），防止并发写消息
+
+#### 3. chat-core ReActLoop — 原生 Function Calling + 纯文本兜底
+
+`chat_core/core/loop.py` 的 ReActLoop 使用相同模式，独特设计：
+
+```python
+class ReActLoop:
+    async def run(self, user_message) -> str:
+        while self._should_continue():   # max_iter=5 硬上限
+            # think: 调用 LLM (支持 function calling, tool_choice="auto")
+            result = await self._think()
+
+            # act: 执行工具 或 纯文本兜底
+            if result.tool_calls:
+                await self._act(result.tool_calls)
+                # 工具结果自动注入 self._messages → 下一轮 _think() 可见
+            else:
+                # 纯文本输出 → 自动合成为 send_reply 工具调用记录
+                # 注入 ReAct 协议历史，然后 prompt 要求补 inner_thoughts
+                pass
+
+            # inner_thoughts 调用 → _done=True → 终止
+```
+
+**与 Claude Code / aichat 的差异**：
+- **inner_thoughts 终止协议**：模型必须显式调用 inner_thoughts 才算终止，不是"无工具调用即结束"
+- **纯文本兜底**：LLM 输出文本不调工具时，自动合成为 send_reply 工具调用注入历史，然后注入 system prompt 要求补写内心戏
+- **max_iter=5**：硬上限比 Claude Code (30) 更激进，匹配短对话场景
+- **流式渲染**：通过 `_on_reply` 回调 + `_on_wait_start`/`_on_wait_end` 打字动画实现
+- **DeepSeek 适配**：`tool_choice="auto"` + `reasoning_effort="max"`，利用纯文本兜底机制规避 reasoning 与 function calling 的 API 兼容性约束
+
+### 关键设计决策对比
+
+| 决策点 | Claude Code | aichat | chat-core ReActLoop |
+|--------|-------------|--------|---------------------|
+| 循环方式 | SDK 内部 while | async 递归 | 显式 while |
+| 工具调用 | 原生 function calling | 原生 + JSON parse 降级 | 原生 function calling + 纯文本兜底 |
+| 终止条件 | 无 tool_use 输出 | tool_results 为空 | inner_thoughts 工具调用 |
+| 并行执行 | 读写分离并发 | 串行 | 串行 (parallel_safe 标记) |
+| 上下文管理 | 自动 compact | 手动压缩检查 | 固定窗口 (500K) + 三级压缩 |
+| 流式渲染 | token-level SSE | producer-consumer channel | 回调驱动 (非流式 LLM + 打字动画) |
+| 错误处理 | 分层: 重试→模型可见→abort | 递归传播 Err | [系统错误] 推入 replies |
+
+### 通用模式的本质
+
+不管你用什么语言、什么 API，核心就三件事：
+
+1. **维护一个消息列表** (`messages: list[dict]`)，每轮往里面追加 `{"role": "assistant", "tool_calls": [...]}` 和 `{"role": "tool", "content": "..."}`
+2. **while 循环调 LLM**，直到模型不再要求工具（或达到 max_iter）
+3. **工具结果注入** 是唯一能让模型"知道"自己做了什么的方式——没有魔法内存，全靠上下文窗口
+
+所有 Agent 框架说到底是同一件事——它们只是在**上下文管理**（compact/compress/summarize）、**工具调度**（并行/串行/超时）、**权限控制**（auto-approve/deny/hook）这三个维度上做了不同取舍。

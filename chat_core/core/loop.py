@@ -15,9 +15,11 @@ from chat_core.core.tools import ToolDefinition, ToolRegistry
 from chat_core.core.types import (
     Message,
     NonStreamResult,
+    StreamEvent,
     StreamEventType,
     ToolCall,
     ToolContext,
+    Usage,
 )
 
 
@@ -77,6 +79,9 @@ class ReActLoop:
         # 流式回调
         self._on_reply: Any = None  # async callable(text: str)
 
+        # 流式 LLM 输出回调（think 阶段）
+        self._on_stream_event: Any = None  # async callable(event: StreamEvent)
+
         # 打字动画回调（T064）
         self._on_wait_start: Any = None  # async callable(seconds: float)
         self._on_wait_end: Any = None    # async callable()
@@ -99,6 +104,10 @@ class ReActLoop:
 
     def set_reply_callback(self, cb: Any) -> None:
         self._on_reply = cb
+
+    def set_stream_callback(self, cb: Any) -> None:
+        """设置流式 LLM 输出回调（think 阶段）"""
+        self._on_stream_event = cb
 
     def set_wait_callbacks(self, on_start: Any, on_end: Any) -> None:
         """设置打字动画回调 (T064)"""
@@ -227,8 +236,15 @@ class ReActLoop:
             if asyncio.iscoroutine(result):
                 await result
 
+    async def _emit_stream_event(self, event: StreamEvent) -> None:
+        """安全触发 _on_stream_event 回调"""
+        if self._on_stream_event:
+            result = self._on_stream_event(event)
+            if asyncio.iscoroutine(result):
+                await result
+
     async def _think(self) -> NonStreamResult | None:
-        """调用 LLM，返回其决策"""
+        """调用 LLM（流式），返回其决策"""
         cfg = get_config()
         brain_cfg = cfg.brain_api_config("sub_session")
 
@@ -237,15 +253,44 @@ class ReActLoop:
         if self._config.temperature is not None:
             temperature = self._config.temperature
 
+        tools_spec = self._tools.specs() if len(self._tools) > 0 else None
+        model = brain_cfg.get("model", "deepseek-v4-flash")
+        max_tokens = brain_cfg.get("max_tokens", 512)
+        reasoning_effort = brain_cfg.get("reasoning_effort", "max")
+
+        accumulated_content = ""
+        accumulated_tool_calls: dict[str, ToolCall] = {}
+        final_usage = Usage.zero()
+        final_reasoning: str | None = None
+
         try:
-            result = await self._provider.chat(
+            async for event in self._provider.stream_chat(
                 messages=self._messages,
-                model=brain_cfg.get("model", "deepseek-v4-flash"),
-                tools=self._tools.specs() if len(self._tools) > 0 else None,
+                model=model,
+                tools=tools_spec,
                 temperature=temperature,
-                max_tokens=brain_cfg.get("max_tokens", 512),
-                reasoning_effort=brain_cfg.get("reasoning_effort", "max"),
-            )
+                max_tokens=max_tokens,
+                reasoning_effort=reasoning_effort,
+            ):
+                # 触发流式回调 → CLI 实时渲染
+                await self._emit_stream_event(event)
+
+                if event.type == StreamEventType.CONTENT_DELTA:
+                    accumulated_content += (event.content or "")
+                elif event.type == StreamEventType.TOOL_CALL_END:
+                    tc = ToolCall(
+                        id=event.tool_call_id or "",
+                        function_name=event.tool_call_name or "",
+                        function_args=event.tool_call_args or "",
+                    )
+                    accumulated_tool_calls[tc.id] = tc
+                elif event.type == StreamEventType.DONE:
+                    if event.usage:
+                        final_usage = event.usage
+                    if event.reasoning_content:
+                        final_reasoning = event.reasoning_content
+                elif event.type == StreamEventType.ERROR:
+                    raise RuntimeError(event.error or "Stream error")
         except Exception as e:
             # LLM 调用失败 → 优雅降级
             error_msg = f"[系统错误: {e}]"
@@ -254,37 +299,65 @@ class ReActLoop:
             self._done = True
             return None
 
+        tool_calls_list = list(accumulated_tool_calls.values())
+        result = NonStreamResult(
+            content=accumulated_content,
+            tool_calls=tool_calls_list,
+            usage=final_usage,
+        )
+
         # 记录 assistant 消息到上下文
         assistant_msg = Message(
             role="assistant",
             content=result.content,
             tool_calls=result.tool_calls if result.tool_calls else None,
+            reasoning_content=final_reasoning,
         )
         self._messages.append(assistant_msg)
 
         return result
 
     async def _act(self, result: NonStreamResult) -> None:
-        """执行 LLM 返回的工具调用"""
-        # 没有 send_reply 工具时的显式文本才加入回复
-        has_send_reply = any(tc.function_name == "send_reply" for tc in (result.tool_calls or []))
-        if result.content.strip() and not has_send_reply:
-            self._replies.append(result.content)
-            await self._emit_reply(result.content)
-
+        """执行 LLM 返回的工具调用。
+        
+        如果 LLM 输出了纯文本（无 tool_calls），自动合成为 send_reply 工具调用，
+        保持 ReAct 协议的 tool_call → tool_result 结构完整性。
+        """
         if not result.tool_calls:
-            # 纯文本回复（无工具调用）
+            # 纯文本 → 合成为 send_reply 工具调用
+            text = result.content.strip()
+            if text:
+                self._replies.append(text)
+                await self._emit_reply(text)
+                # 合成 tool_call + tool_result 注入历史，保持 ReAct 协议
+                fake_tc = ToolCall(
+                    id=f"synth_{self._iteration}",
+                    function_name="send_reply",
+                    function_args=json.dumps({"text": text}, ensure_ascii=False),
+                )
+                self._messages[-1] = Message(
+                    role="assistant",
+                    content=result.content,
+                    tool_calls=[fake_tc],
+                    reasoning_content=self._messages[-1].reasoning_content,
+                )
+                self._messages.append(Message(
+                    role="tool",
+                    content=json.dumps({"sent": True}),
+                    tool_call_id=fake_tc.id,
+                ))
+            
             # 如果还没写内心戏，追加一次 LLM 调用要求补 inner_thoughts
             if self._inner_thoughts_raw is None and not self._inner_thoughts_retried:
                 self._inner_thoughts_retried = True
                 self._messages.append(Message(
                     role="system",
-                    content="你的发言已结束。请现在调用 inner_thoughts 写下你的内心想法，然后调用 done。"
+                    content="你的发言已结束。请现在调用 inner_thoughts 写下你的内心想法。"
                 ))
             else:
                 self._done = True
             return
-
+        
         ctx = ToolContext(
             root_dir=".",
             session_id="sub_session",

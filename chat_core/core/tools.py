@@ -56,6 +56,9 @@ class ToolRegistry:
             raise ValueError(f"Tool '{defn.name}' already registered")
         self._tools[defn.name] = defn
 
+    def unregister(self, name: str) -> None:
+        self._tools.pop(name, None)
+
     def has(self, name: str) -> bool:
         return name in self._tools
 

@@ -206,12 +206,12 @@ async def main():
 
     async def t_us5_boredom():
         import math
-        # 测试无聊公式本身: B(t) = eval × e^(-t/600)
+        # 测试无聊公式: B(t) = 1 - eval × e^(-t/600)，随时间递增
         t = 700
         eval_param = 0.9
-        boredom = eval_param * math.exp(-t / 600)
-        assert boredom < 0.30, f"公式: 700s后无聊={boredom:.3f}, 应<0.30触发"
-    await run_test("US5-FR23-无聊衰减公式", t_us5_boredom)
+        boredom = 1 - eval_param * math.exp(-t / 600)
+        assert boredom > 0.70, f"公式: 700s后无聊={boredom:.3f}, 应>0.70触发"
+    await run_test("US5-FR23-无聊递增公式", t_us5_boredom)
 
     async def t_us5_intent():
         text = "刚才聊得挺好的。我是否想要做什么: 下次聊天气的时候提醒带伞"

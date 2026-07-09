@@ -45,6 +45,8 @@ class ProactiveSystem:
         personality_engine: PersonalityEngine | None = None,
         attention_model: AttentionModel | None = None,
         correct_fn: Callable[[ReviewResult, list[str]], Any] | None = None,
+        reply_callback: Any = None,
+        stream_callback: Any = None,
     ):
         self._provider = provider
         self._memory = memory
@@ -56,6 +58,10 @@ class ProactiveSystem:
         self._personality_engine = personality_engine
         self._attention_model = attention_model
         self._correct_fn = correct_fn
+
+        # 流式回调（由 CLI 注入，供主动发言子Session 使用）
+        self._reply_callback = reply_callback
+        self._stream_callback = stream_callback
 
         # 主动子Session 状态
         self._proactive_loop: ReActLoop | None = None
@@ -229,6 +235,12 @@ class ProactiveSystem:
         )
         register_sub_session_tools(tools, loop)
         _enhance_recall(tools, self._memory, self._personality_engine)
+
+        # 注入 CLI 回调（流式输出 + 回复显示）
+        if self._reply_callback:
+            loop.set_reply_callback(self._reply_callback)
+        if self._stream_callback:
+            loop.set_stream_callback(self._stream_callback)
 
         self._proactive_loop = loop
         self._proactive_active = True
@@ -502,7 +514,8 @@ def _enhance_recall(
     personality_engine: PersonalityEngine | None = None,
 ) -> None:
     """替换子Session 的 recall 为真实记忆检索"""
-
+    # 先移除已有的 recall（register_sub_session_tools 可能已注册）
+    tools.unregister("recall")
     tools.register(ToolDefinition(
         name="recall",
         description="从记忆中检索相关信息。只读。",

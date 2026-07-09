@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from typing import Any
 
 from chat_core.config import get_config
@@ -162,13 +163,30 @@ class LogicBrain:
 
         # 执行工具调用（recall + memory_link）
         memories: list[MemoryEntry] = []
+        tool_results: list[Message] = []
         if result.tool_calls:
             for tc in result.tool_calls:
                 if tc.function_name == "recall":
                     entries = await self._execute_recall(tc)
                     memories.extend(entries)
+                    tool_results.append(Message(
+                        role="tool",
+                        content=json.dumps(
+                            {"results": len(entries), "entries": [
+                                {"namespace": e.namespace, "key": e.key}
+                                for e in entries[:10]
+                            ]},
+                            ensure_ascii=False,
+                        ),
+                        tool_call_id=tc.id,
+                    ))
                 elif tc.function_name == "memory_link":
                     await self._execute_memory_link(tc)
+                    tool_results.append(Message(
+                        role="tool",
+                        content=json.dumps({"linked": True}),
+                        tool_call_id=tc.id,
+                    ))
 
         # 追加 assistant 到历史
         self._history.append(Message(
@@ -176,6 +194,12 @@ class LogicBrain:
             content=result.content,
             tool_calls=result.tool_calls if result.tool_calls else None,
         ))
+        # 追加 tool 结果到历史（OpenAI API 要求）
+        self._history.extend(tool_results)
+
+        # LLM rerank: 去重后取 top 5 最相关
+        if len(memories) > 5:
+            memories = await self._rerank_memories(memories, user_message)
 
         return memories, result.content
 
@@ -211,6 +235,7 @@ class LogicBrain:
         )
 
         injection: dict[str, Any] = {"context": "", "direction": ""}
+        tool_inject_results: list[Message] = []
         if result.tool_calls:
             for tc in result.tool_calls:
                 if tc.function_name == "inject_to_sub":
@@ -218,6 +243,11 @@ class LogicBrain:
                         injection = json.loads(tc.function_args)
                     except json.JSONDecodeError:
                         pass
+                tool_inject_results.append(Message(
+                    role="tool",
+                    content=json.dumps({"injected": True}),
+                    tool_call_id=tc.id,
+                ))
 
         # 追加到历史
         self._history.append(Message(
@@ -225,6 +255,7 @@ class LogicBrain:
             content=result.content,
             tool_calls=result.tool_calls if result.tool_calls else None,
         ))
+        self._history.extend(tool_inject_results)
 
         return injection
 
@@ -243,6 +274,57 @@ class LogicBrain:
             for e in entries
         ]
         return json.dumps({"results": results, "count": len(results)}, ensure_ascii=False)
+
+    async def _rerank_memories(
+        self, memories: list[MemoryEntry], query: str
+    ) -> list[MemoryEntry]:
+        """LLM rerank: 从最多 20 条记忆中选出 top 5 最相关的。
+        
+        使用简短 prompt + max_tokens=64 + 1s timeout 保证低延迟。
+        失败时返回原始列表的前 5 条（安全降级）。
+        """
+        if len(memories) <= 5:
+            return memories
+
+        # 构建候选列表
+        candidates = []
+        for i, m in enumerate(memories[:20]):
+            val_str = json.dumps(m.value, ensure_ascii=False)[:200]
+            candidates.append(f"{i+1}. [{m.namespace}/{m.key}] {val_str}")
+
+        prompt = (
+            f"用户问题是: {query}\n\n"
+            f"候选记忆:\n" + "\n".join(candidates) + "\n\n"
+            f"请选出与用户问题最相关的 5 条记忆，只返回编号，用逗号分隔。\n"
+            f"示例输出: 3,7,1,12,5"
+        )
+
+        try:
+            result = await asyncio.wait_for(
+                self._provider.chat(
+                    messages=[Message(role="user", content=prompt)],
+                    model="deepseek-v4-flash",
+                    max_tokens=64,
+                    temperature=0.0,
+                ),
+                timeout=1.0,
+            )
+            # 解析编号
+            nums = [int(n) - 1 for n in re.findall(r'\d+', result.content)]
+            ranked = []
+            seen_idx: set[int] = set()
+            for idx in nums:
+                if 0 <= idx < len(memories) and idx not in seen_idx:
+                    seen_idx.add(idx)
+                    ranked.append(memories[idx])
+                if len(ranked) >= 5:
+                    break
+            if ranked:
+                return ranked
+        except Exception:
+            pass  # 降级: 返回前 5 条
+
+        return memories[:5]
 
     async def _execute_recall(self, tc: ToolCall) -> list[MemoryEntry]:
         try:
@@ -389,6 +471,7 @@ class EmotionBrain:
         )
 
         memories: list[MemoryEntry] = []
+        tool_results: list[Message] = []
         if result.tool_calls:
             for tc in result.tool_calls:
                 if tc.function_name == "recall":
@@ -396,6 +479,11 @@ class EmotionBrain:
                         args = json.loads(tc.function_args)
                         entries = await self._memory.search(str(args.get("query", "")), top_n=10)
                         memories.extend(entries)
+                        tool_results.append(Message(
+                            role="tool",
+                            content=json.dumps({"results": len(entries)}, ensure_ascii=False),
+                            tool_call_id=tc.id,
+                        ))
                     except Exception:
                         pass
 
@@ -404,6 +492,7 @@ class EmotionBrain:
             content=result.content,
             tool_calls=result.tool_calls if result.tool_calls else None,
         ))
+        self._history.extend(tool_results)
 
         return memories, result.content
 
@@ -436,6 +525,7 @@ class EmotionBrain:
         )
 
         injection: dict[str, Any] = {"context": "", "direction": ""}
+        tool_inject_results: list[Message] = []
         if result.tool_calls:
             for tc in result.tool_calls:
                 if tc.function_name == "inject_to_sub":
@@ -443,12 +533,18 @@ class EmotionBrain:
                         injection = json.loads(tc.function_args)
                     except json.JSONDecodeError:
                         pass
+                tool_inject_results.append(Message(
+                    role="tool",
+                    content=json.dumps({"injected": True}),
+                    tool_call_id=tc.id,
+                ))
 
         self._history.append(Message(
             role="assistant",
             content=result.content,
             tool_calls=result.tool_calls if result.tool_calls else None,
         ))
+        self._history.extend(tool_inject_results)
 
         return injection
 

@@ -76,13 +76,15 @@ class MemoryStore:
                 PRIMARY KEY (namespace, key)
             )
         """)
-        # FTS5 全文索引
+        # FTS5 全文索引（列名必须与 memories 表一致）
         await self._db.execute("""
             CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
-                namespace, key, value_text, topic_tags, entity_type,
+                namespace, key, value, topic_tags, entity_type,
                 content='memories', content_rowid='rowid'
             )
         """)
+        # 迁移：修复 value_text → value 列名
+        await self._migrate_fts_columns()
         # 关联表
         await self._db.execute("""
             CREATE TABLE IF NOT EXISTS memory_links (
@@ -97,24 +99,52 @@ class MemoryStore:
         # 触发器：自动同步 FTS5
         await self._db.execute("""
             CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
-                INSERT INTO memories_fts(rowid, namespace, key, value_text, topic_tags, entity_type)
+                INSERT INTO memories_fts(rowid, namespace, key, value, topic_tags, entity_type)
                 VALUES (new.rowid, new.namespace, new.key, new.value, new.topic_tags, new.entity_type);
             END
         """)
         await self._db.execute("""
             CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
-                INSERT INTO memories_fts(memories_fts, rowid, namespace, key, value_text, topic_tags, entity_type)
+                INSERT INTO memories_fts(memories_fts, rowid, namespace, key, value, topic_tags, entity_type)
                 VALUES ('delete', old.rowid, old.namespace, old.key, old.value, old.topic_tags, old.entity_type);
             END
         """)
         await self._db.execute("""
             CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
-                INSERT INTO memories_fts(memories_fts, rowid, namespace, key, value_text, topic_tags, entity_type)
+                INSERT INTO memories_fts(memories_fts, rowid, namespace, key, value, topic_tags, entity_type)
                 VALUES ('delete', old.rowid, old.namespace, old.key, old.value, old.topic_tags, old.entity_type);
-                INSERT INTO memories_fts(rowid, namespace, key, value_text, topic_tags, entity_type)
+                INSERT INTO memories_fts(rowid, namespace, key, value, topic_tags, entity_type)
                 VALUES (new.rowid, new.namespace, new.key, new.value, new.topic_tags, new.entity_type);
             END
         """)
+
+    async def _migrate_fts_columns(self) -> None:
+        """迁移：修复旧版 value_text 列名 → value（与主表列名一致）。
+        
+        FTS5 外部内容表要求列名与主表完全一致，否则 MATCH 查询回读主表
+        时会报 'no such column: T.value_text'。
+        """
+        assert self._db
+        # 检查 FTS 表是否使用旧列名 value_text
+        cursor = await self._db.execute("PRAGMA table_info('memories_fts')")
+        columns = [row[1] for row in await cursor.fetchall()]
+        if "value_text" in columns:
+            # 重建 FTS 表
+            await self._db.execute("DROP TRIGGER IF EXISTS memories_ai")
+            await self._db.execute("DROP TRIGGER IF EXISTS memories_ad")
+            await self._db.execute("DROP TRIGGER IF EXISTS memories_au")
+            await self._db.execute("DROP TABLE IF EXISTS memories_fts")
+            await self._db.execute("""
+                CREATE VIRTUAL TABLE memories_fts USING fts5(
+                    namespace, key, value, topic_tags, entity_type,
+                    content='memories', content_rowid='rowid'
+                )
+            """)
+            # 从主表重建索引
+            await self._db.execute(
+                "INSERT INTO memories_fts(rowid, namespace, key, value, topic_tags, entity_type) "
+                "SELECT rowid, namespace, key, value, topic_tags, entity_type FROM memories"
+            )
 
     # ── CRUD ────────────────────────────────────────────────
 
@@ -190,10 +220,14 @@ class MemoryStore:
                         to_key=f"{row['to_namespace']}/{row['to_key']}",
                         relation=RelationType(row['relation']),
                     )
-                    if (row['to_namespace'], row['to_key']) not in visited:
-                        result.append(link)
-                        visited.add((row['to_namespace'], row['to_key']))
-                        next_layer.append((row['to_namespace'], row['to_key']))
+                    result.append(link)
+                    # 双向追踪：链接两端都加入下一层扩散
+                    from_pair = (row['from_namespace'], row['from_key'])
+                    to_pair = (row['to_namespace'], row['to_key'])
+                    for pair in (from_pair, to_pair):
+                        if pair not in visited:
+                            visited.add(pair)
+                            next_layer.append(pair)
             current = next_layer
 
         return result
@@ -218,12 +252,18 @@ class MemoryStore:
         namespace_prefix: str | None = None,
         top_n: int = 20,
     ) -> list[MemoryEntry]:
-        """FTS5 全文检索 → LIKE 降级"""
+        """FTS5 全文检索 → LIKE 降级 → spread activation (memory_links depth=2) → cluster boost (same topic_tags)"""
         assert self._db
 
         results = await self._search_fts5(query, namespace_prefix, top_n)
         if not results:
             results = await self._search_like(query, namespace_prefix, top_n)
+
+        # 扩散激活：对 top 5 结果跟踪 memory_links (depth=2)
+        results = await self._spread_activate(results, max_seeds=5, depth=2)
+
+        # 聚类增强：有共同 topic_tags 的结果排前面
+        results = self._cluster_boost(results)
         return results
 
     async def _search_fts5(self, query: str, namespace_prefix: str | None, top_n: int) -> list[MemoryEntry]:
@@ -275,6 +315,86 @@ class MemoryStore:
         cursor = await self._db.execute(sql, params)
         rows = await cursor.fetchall()
         return [self._row_to_entry(r) for r in rows if r]
+
+    async def _spread_activate(
+        self,
+        seeds: list[MemoryEntry],
+        max_seeds: int = 5,
+        depth: int = 2,
+    ) -> list[MemoryEntry]:
+        """扩散激活：对 top-N 种子记忆追踪 memory_links，附带回关联条目。
+        
+        从种子记忆出发，沿 memory_links 扩散 depth 层，收集所有可达条目。
+        直接查 links 表（避免复合 key 解析问题）。
+        """
+        if not seeds:
+            return seeds
+
+        seen: set[tuple[str, str]] = {
+            (e.namespace, e.key) for e in seeds
+        }
+        linked_entries: list[MemoryEntry] = []
+        current: list[tuple[str, str]] = [
+            (e.namespace, e.key) for e in seeds[:max_seeds]
+        ]
+
+        for _ in range(depth):
+            next_layer: list[tuple[str, str]] = []
+            for ns, k in current:
+                cursor = await self._db.execute(
+                    "SELECT from_namespace, from_key, to_namespace, to_key "
+                    "FROM memory_links "
+                    "WHERE (from_namespace=? AND from_key=?) "
+                    "   OR (to_namespace=? AND to_key=?)",
+                    (ns, k, ns, k),
+                )
+                rows = await cursor.fetchall()
+                for row in rows:
+                    for pair in (
+                        (row[0], row[1]),  # from
+                        (row[2], row[3]),  # to
+                    ):
+                        if pair not in seen and pair != (ns, k):
+                            seen.add(pair)
+                            next_layer.append(pair)
+                            entry = await self.get(pair[0], pair[1])
+                            if entry:
+                                linked_entries.append(entry)
+            current = next_layer
+
+        return seeds + linked_entries
+
+    def _cluster_boost(self, entries: list[MemoryEntry]) -> list[MemoryEntry]:
+        """聚类增强：统计 topic_tags 频率，将共享标签多的条目移到前面。
+        
+        不改变条目本身，只调整排序。无标签的条目保持原位。
+        """
+        if len(entries) <= 1:
+            return entries
+
+        # 统计每个 tag 的出现次数
+        import json as _json
+        tag_freq: dict[str, int] = {}
+        for e in entries:
+            try:
+                tags = _json.loads(e.topic_tags) if e.topic_tags else []
+            except Exception:
+                tags = []
+            for tag in tags:
+                tag_freq[tag] = tag_freq.get(tag, 0) + 1
+
+        if not tag_freq:
+            return entries  # 无标签，无需重排
+
+        # 计算每个条目的共享得分（其标签中最多出现次数）
+        def _cluster_score(entry: MemoryEntry) -> int:
+            try:
+                tags = _json.loads(entry.topic_tags) if entry.topic_tags else []
+            except Exception:
+                return 0
+            return max((tag_freq.get(t, 1) for t in tags), default=0)
+
+        return sorted(entries, key=_cluster_score, reverse=True)
 
     async def query(
         self,

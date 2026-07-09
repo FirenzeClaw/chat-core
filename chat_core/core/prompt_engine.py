@@ -133,6 +133,11 @@ class PromptEngine:
             f"3. 建立记忆之间的关联(memory_link)\n"
             f"4. 向发言脑注入上下文和方向指导(inject_to_sub)\n"
             f"5. 审查发言脑的输出是否正确\n\n"
+            f"【memory_link 使用指南】\n"
+            f"- 当你发现两条记忆讲的是同一件事（如不同时间的同一话题）→ 用 extends 关联\n"
+            f"- 当新记忆与已有记忆矛盾（如用户说改了偏好）→ 用 contradicts 标记冲突\n"
+            f"- 当两条记忆内容相关但无直接因果 → 用 related_to 建立联系\n"
+            f"- 格式: from_key 和 to_key 使用 \"namespace/key\" 格式\n\n"
             f"你不直接对用户说话。记住：子Session是唯一的嘴。"
         )
 

@@ -10,8 +10,9 @@
 
 - **语言**: Python 3.12+
 - **范式**: asyncio 异步，四脑并发
-- **入口**: `chat_core/cli.py` → `chat-core` 命令
+- **入口**: `chat_core/cli.py` → `chat-core` 命令（默认走 TurnManager 四脑管线，`--direct` 降级到直接 ReActLoop）
 - **定位**: 本地单用户 CLI，零外部编排依赖
+- **模型**: DeepSeek V4 (Pro 主脑 + Flash 子Session)，reasoning_effort 与 function calling 互斥（子Session 用纯文本兜底方案兼容）
 
 ---
 
@@ -34,6 +35,20 @@
 
 **核心铁律**: 主脑不发言，子Session 是唯一的嘴。inner_thoughts 调用即结束（无需单独 done）。
 
+### 回调链路
+
+```
+CLI (_on_reply, _on_stream_event)
+  → TurnManager.set_reply_callback / set_stream_callback
+    → _run_sub_session() → loop.set_*_callback()          # 正常子Session
+    → _run_correction_sub_session() → loop.set_stream_callback()  # 纠正子Session
+    → ProactiveSystem(reply_callback, stream_callback)
+      → _on_proactive_trigger() → loop.set_*_callback()   # 主动子Session
+```
+
+子Session `_think()` 使用 `stream_chat()` 流式 LLM 输出，通过 `_on_stream_event` 推送到 `rich.Live` 面板。
+`reasoning_content`（DeepSeek 推理链）从流式 DONE event 捕获，存入 `Message.reasoning_content`，`_serialize_messages()` 回传。
+
 ---
 
 ## 文件索引
@@ -55,9 +70,9 @@
 |------|------|------------|
 | `types.py` | 全部共享数据类型 (40+ dataclass/enum) | `Message`, `ConversationTurn`, `EmotionState`, `MemoryEntry`, `ReviewResult`, `Intent`, `StreamEvent`, `ActionResult` |
 | `provider.py` | AsyncOpenAI 封装 (流式+非流式) | `ModelProvider.chat()`, `ModelProvider.stream_chat()` |
-| `tools.py` | 工具注册与执行 (并行safe+串行) | `ToolRegistry`, `ToolDefinition` |
+| `tools.py` | 工具注册与执行 (并行safe+串行) | `ToolRegistry`, `ToolDefinition`, `unregister()` |
 | `prompt_engine.py` | 三层 Prompt 编译 (persona+rules+tools) | `PromptEngine.build_sub_session_prompt()`, `build_logic_brain_prompt()`, `build_emotion_brain_prompt()` |
-| `loop.py` | 子Session ReAct 循环引擎 | `ReActLoop.run()`, `_think()`, `_act()`, `SubSessionConfig`, `register_sub_session_tools()`, `_handle_send_reply()`, `_handle_recall()` |
+| `loop.py` | 子Session ReAct 循环引擎（纯文本自动合成 send_reply 兜底） | `ReActLoop.run()`, `_think()`, `_act()`, `SubSessionConfig`, `register_sub_session_tools()`, `_handle_send_reply()`, `_handle_recall()` |
 | `brain.py` | 四脑实现 + 并发池 | `LogicBrain`, `EmotionBrain`, `ActionBrain`, `ActionBrainPool`, `_RateLimiter` |
 | `turn_manager.py` | Turn 编排 + EventBus | `TurnManager.process_turn()`, `EventBus` |
 | `safety.py` | 内容安全过滤 | `ContentFilter.check_safety()` |
@@ -67,7 +82,7 @@
 
 | 文件 | 职责 | 关键类 |
 |------|------|--------|
-| `memory.py` | SQLite FTS5 + jieba 分词记忆存储 | `MemoryStore`, `_segment_chinese()` |
+| `memory.py` | SQLite FTS5 + jieba 分词记忆存储，含 spread activation + cluster boost | `MemoryStore`, `_segment_chinese()`, `_spread_activate()`, `_cluster_boost()` |
 | `emotion.py` | 10维×3脑情绪引擎 (衰减+传染) | `EmotionEngine` |
 | `personality.py` | 8维人格权重 → 行为参数映射 | `PersonalityEngine` |
 | `attention.py` | Focus/Dominance 注意力模型 | `AttentionModel` |
@@ -80,6 +95,8 @@
 ---
 
 ## 关键数据流
+
+> **注意**：TurnManager 管线是默认执行路径（`cli.py` 无 `--direct` 参数时）。`--direct` 降级模式下跳过双脑+审查+纠正，直接运行 ReActLoop。
 
 ### 一个 Turn 的完整流程
 
@@ -118,7 +135,12 @@ MemoryStore.search(query)
   ├─ 1. _segment_chinese(query) → jieba 分词
   ├─ 2. FTS5 MATCH (OR'd tokens)
   ├─ 3. LIKE 降级 (FTS5 无结果时)
-  └─ 4. TTL 过期过滤
+  ├─ 4. _spread_activate(seeds, depth=2) → 沿 memory_links 扩散激活关联记忆
+  ├─ 5. _cluster_boost(entries) → 按共享 topic_tags 排序提升聚类条目
+  └─ 6. TTL 过期过滤
+
+LogicBrain._rerank_memories() (T022)
+  └─ LLM rerank: >5条候选 → flash模型重排top 5, 1s timeout + 降级保护
 ```
 
 ### 子Session 工具执行流程
@@ -243,3 +265,4 @@ python -m pytest tests/ --cov=chat_core --cov-report=term
 | 技术决策 | `specs/001-chat-core-cli/research.md` |
 | CLI 接口契约 | `specs/001-chat-core-cli/contracts/cli-contract.md` |
 | 原始架构设计 | `chat-core-design.md` |
+| Agent 状态机模式分析 | `chat-cli-research.md` §Agent 状态机核心模式 |

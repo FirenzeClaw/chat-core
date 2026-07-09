@@ -20,12 +20,14 @@ from rich.status import Status
 from rich.text import Text
 
 from chat_core.config import get_config, Config
+from chat_core.core.brain import ActionBrainPool, EmotionBrain, LogicBrain
 from chat_core.core.history import HistoryManager
 from chat_core.core.loop import ReActLoop, SubSessionConfig, register_sub_session_tools
 from chat_core.core.provider import ModelProvider
 from chat_core.core.prompt_engine import PromptEngine
 from chat_core.core.tools import ToolRegistry
-from chat_core.core.types import StreamEventType
+from chat_core.core.turn_manager import TurnManager
+from chat_core.core.types import DecisionType, StreamEvent, StreamEventType
 from chat_core.systems.emotion import EmotionEngine
 from chat_core.systems.personality import PersonalityEngine
 from chat_core.systems.attention import AttentionModel
@@ -100,9 +102,13 @@ class InterruptHandler:
     def __init__(self):
         self._last_sigint = 0.0
         self._loop: ReActLoop | None = None
+        self._task: asyncio.Task | None = None
 
     def set_loop(self, loop: ReActLoop | None) -> None:
         self._loop = loop
+
+    def set_task(self, task: asyncio.Task | None) -> None:
+        self._task = task
 
     def handle(self, signum: int, frame: object) -> None:
         now = time.time()
@@ -115,6 +121,9 @@ class InterruptHandler:
         if self._loop:
             self._loop.cancel()
             console.print("\n[yellow]⏸ 已请求停止... (再按一次 Ctrl+C 强制退出并保存状态)[/]")
+        elif self._task and not self._task.done():
+            self._task.cancel()
+            console.print("\n[yellow]⏸ 已请求取消当前 turn... (再按一次 Ctrl+C 强制退出并保存状态)[/]")
         else:
             console.print("\n[yellow]⏸ 正在处理...[/]")
 
@@ -183,10 +192,74 @@ async def _on_wait_end() -> None:
 _typing_status: Status | None = None
 
 
+# ── 流式 UI (think 阶段实时渲染) ──────────────────────────
+
+_stream_live: Live | None = None
+_stream_buffer: str = ""
+
+
+async def _on_stream_event(event: StreamEvent) -> None:
+    """流式事件回调 — 在 rich.Live 中实时渲染 LLM 推理输出"""
+    global _stream_live, _stream_buffer
+
+    if _stream_live is None:
+        # 首次事件 → 创建 Live context
+        _stream_live = Live(
+            Panel("", border_style="dim bright_cyan", title="[dim]小深正在思考...[/]"),
+            console=console,
+            refresh_per_second=10,
+            transient=False,
+        )
+        _stream_live.start()
+
+    if event.type == StreamEventType.CONTENT_DELTA:
+        _stream_buffer += (event.content or "")
+        _stream_live.update(Panel(
+            Text(_stream_buffer[-500:], style="italic dim"),
+            border_style="dim bright_cyan",
+            title="[dim]💭 推理中...[/]",
+        ))
+    elif event.type == StreamEventType.TOOL_CALL_START:
+        _stream_live.update(Panel(
+            Text(
+                f"{_stream_buffer[-300:]}\n\n🔧 调用工具: {event.tool_call_name}...",
+                style="italic dim",
+            ),
+            border_style="dim bright_cyan",
+            title="[dim]💭 执行中...[/]",
+        ))
+    elif event.type == StreamEventType.TOOL_CALL_DELTA:
+        pass  # tool args 增量太碎，不单独渲染
+    elif event.type == StreamEventType.TOOL_CALL_END:
+        _stream_live.update(Panel(
+            Text(
+                f"{_stream_buffer[-300:]}\n\n✅ {event.tool_call_name} 完成",
+                style="italic dim",
+            ),
+            border_style="dim bright_cyan",
+            title="[dim]💭 执行中...[/]",
+        ))
+    elif event.type == StreamEventType.DONE:
+        _stream_buffer = ""
+        if _stream_live:
+            _stream_live.stop()
+            _stream_live = None
+    elif event.type == StreamEventType.ERROR:
+        if _stream_live:
+            _stream_live.stop()
+            _stream_live = None
+
+
 # ── 回复回调 ──────────────────────────────────────────────
 
 async def _on_reply(text: str) -> None:
     """send_reply 回调 — 用 rich 渲染 AI 回复"""
+    global _stream_live
+    # 停止流式面板（如果还在跑）
+    if _stream_live:
+        _stream_live.stop()
+        _stream_live = None
+
     panel = Panel(
         Markdown(text),
         border_style="bright_magenta",
@@ -208,6 +281,15 @@ def _record_topics(text: str, interest_model: InterestModel) -> None:
         if 2 <= len(token) <= 4 and token not in seen:
             seen.add(token)
             interest_model.record_topic(token)
+
+
+def _preload_jieba() -> None:
+    """预加载 jieba 词典（避免首次 recall 时阻塞加载）"""
+    try:
+        import jieba
+        jieba.cut("预加载")
+    except ImportError:
+        pass
 
 
 async def _process_message(
@@ -261,7 +343,7 @@ async def _process_message(
 
 # ── 主聊天循环 ────────────────────────────────────────────
 
-async def _chat_loop(config_path: Path | None = None) -> None:
+async def _chat_loop(config_path: Path | None = None, direct_mode: bool = False) -> None:
     """主聊天循环"""
     global _emotion_engine, _personality_engine, _history_manager
 
@@ -278,6 +360,9 @@ async def _chat_loop(config_path: Path | None = None) -> None:
             "[dim]或将 key 写入 chat_core/.env 文件: DEEPSEEK_API_KEY=sk-xxx[/]"
         )
         return
+
+    # 预加载 jieba 词典（避免首次 recall 时阻塞）
+    _preload_jieba()
 
     # 初始化组件
     provider = ModelProvider(api_cfg)
@@ -305,6 +390,27 @@ async def _chat_loop(config_path: Path | None = None) -> None:
 
     # 启动情绪引擎后台 tick
     await emotion_engine.start()
+
+    # TurnManager 组件（非 direct 模式使用完整四脑管线）
+    turn_manager: TurnManager | None = None
+    if not direct_mode:
+        logic_brain = LogicBrain(provider, memory_store, prompt_engine)
+        emotion_brain = EmotionBrain(provider, memory_store, prompt_engine)
+        action_pool = ActionBrainPool()
+        action_pool.configure(provider, memory_store, prompt_engine)
+        turn_manager = TurnManager(
+            logic_brain=logic_brain,
+            emotion_brain=emotion_brain,
+            provider=provider,
+            memory=memory_store,
+            prompt_engine=prompt_engine,
+            action_pool=action_pool,
+            emotion_engine=emotion_engine,
+            personality_engine=personality_engine,
+            attention_model=attention_model,
+        )
+        turn_manager.set_stream_callback(_on_stream_event)
+        turn_manager.set_reply_callback(_on_reply)
 
     system_prompt = prompt_engine.build_sub_session_prompt()
 
@@ -391,26 +497,6 @@ async def _chat_loop(config_path: Path | None = None) -> None:
                 console.print(f"[dim]未知命令: {user_input}[/]")
             continue
 
-        # 创建新的 ReActLoop
-        tools = ToolRegistry()
-        personality_temp = personality_engine.get_llm_temperature("sub_session")
-        sub_config = SubSessionConfig(
-            max_iter=config.brain_max_iter("sub_session"),
-            temperature=personality_temp,
-        )
-
-        loop = ReActLoop(
-            provider=provider,
-            tool_registry=tools,
-            system_prompt=system_prompt,
-            config=sub_config,
-            attention_model=attention_model,
-        )
-        register_sub_session_tools(tools, loop, memory_store)
-        loop.set_reply_callback(_on_reply)
-        # T064: 设置打字动画回调
-        loop.set_wait_callbacks(_on_wait_start, _on_wait_end)
-
         # 显示用户消息
         console.print(Panel(
             user_input,
@@ -422,20 +508,127 @@ async def _chat_loop(config_path: Path | None = None) -> None:
         # T065: 记录用户消息
         history_manager.append(role="user", content=user_input)
 
-        await _process_message(user_input, loop, config, interest_model)
-
-        # T065: 记录 AI 回复
-        if loop.replies:
-            full_reply = "\n".join(loop.replies)
-            brain_metadata = {
-                "speaker": "sub_session",
-                "inner_thoughts": loop.inner_thoughts,
-            }
-            history_manager.append(
-                role="assistant",
-                content=full_reply,
-                brain_metadata=brain_metadata,
+        if direct_mode or turn_manager is None:
+            # ── 降级路径：直接 ReActLoop 模式 (--direct) ──
+            tools = ToolRegistry()
+            personality_temp = personality_engine.get_llm_temperature("sub_session")
+            sub_config = SubSessionConfig(
+                max_iter=config.brain_max_iter("sub_session"),
+                temperature=personality_temp,
             )
+
+            loop = ReActLoop(
+                provider=provider,
+                tool_registry=tools,
+                system_prompt=system_prompt,
+                config=sub_config,
+                attention_model=attention_model,
+            )
+            register_sub_session_tools(tools, loop, memory_store)
+            loop.set_reply_callback(_on_reply)
+            loop.set_stream_callback(_on_stream_event)
+            loop.set_wait_callbacks(_on_wait_start, _on_wait_end)
+
+            await _process_message(user_input, loop, config, interest_model)
+
+            # T065: 记录 AI 回复
+            if loop.replies:
+                full_reply = "\n".join(loop.replies)
+                brain_metadata = {
+                    "speaker": "sub_session",
+                    "inner_thoughts": loop.inner_thoughts,
+                }
+                history_manager.append(
+                    role="assistant",
+                    content=full_reply,
+                    brain_metadata=brain_metadata,
+                )
+        else:
+            # ── 完整四脑管线：TurnManager 模式 ──
+            with Status("[dim bright_magenta]小深正在思考...[/]", spinner="dots"):
+                task = asyncio.ensure_future(
+                    turn_manager.process_turn(user_input)
+                )
+                _interrupt.set_task(task)
+                try:
+                    turn = await task
+                except asyncio.CancelledError:
+                    console.print("[yellow]⏸ Turn 已取消[/]")
+                    _show_emotion_status(emotion_engine)
+                    continue
+                finally:
+                    _interrupt.set_task(None)
+
+            # 显示 AI 回复
+            if turn.reply_segments:
+                reply_text = "\n".join(s.text for s in turn.reply_segments)
+                console.print(Panel(
+                    Markdown(reply_text),
+                    border_style="bright_magenta",
+                    title="小深",
+                    title_align="left",
+                ))
+                history_manager.append(
+                    role="assistant",
+                    content=reply_text,
+                    brain_metadata={
+                        "speaker": "sub_session",
+                        "inner_thoughts": turn.inner_thoughts_raw,
+                    },
+                )
+            elif not turn.inner_thoughts_raw:
+                console.print("[dim](无回复)[/]")
+
+            # 显示内心戏 + 审查结论 + 意图
+            if turn.inner_thoughts_raw:
+                inner_text = turn.inner_thoughts_raw
+                panel_content = Text(inner_text, style="italic")
+
+                # Phase 7: 提取话题 → InterestModel，提取意图
+                if interest_model and inner_text:
+                    _record_topics(inner_text, interest_model)
+                    intent = extract_intent(inner_text)
+                    if intent.action.value != "none":
+                        panel_content.append("\n\n")
+                        panel_content.append(
+                            f"[意图] {intent.action.value}: {intent.detail[:100]}",
+                            style="bold yellow",
+                        )
+
+                # 审查结论
+                if turn.review:
+                    review = turn.review
+                    decision_labels = {
+                        DecisionType.CORRECT: "纠正",
+                        DecisionType.SILENCE: "沉默归档",
+                        DecisionType.TWISTED: "拧巴",
+                    }
+                    decision_label = decision_labels.get(review.decision, review.decision.value)
+                    panel_content.append("\n\n")
+                    panel_content.append(
+                        f"[审查] L={review.logic_weight:.2f} E={review.emotion_weight:.2f} "
+                        f"C={review.combined_weight:.2f} → {decision_label}",
+                        style="dim cyan",
+                    )
+
+                console.print(Panel(
+                    panel_content,
+                    border_style="dim",
+                    title="[dim]内心戏 (仅 debug 可见)[/]",
+                    title_align="left",
+                ))
+
+            # 显示纠正信息
+            if turn.correction:
+                correction = turn.correction
+                twisted_note = " (拧巴)" if correction.is_twisted else ""
+                console.print(Panel(
+                    f"[bold yellow]⚠ 自我纠正 — {correction.source}{twisted_note}[/]\n"
+                    f"{correction.message}",
+                    border_style="yellow",
+                    title="审查纠正",
+                    title_align="left",
+                ))
 
         # T064: 显示情绪状态栏
         _show_emotion_status(emotion_engine)
@@ -557,6 +750,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="chat-core — 四脑模型 AI 聊天 CLI")
     parser.add_argument("-c", "--config", type=Path, help="配置文件路径")
     parser.add_argument("--no-color", action="store_true", help="禁用彩色输出")
+    parser.add_argument(
+        "--direct",
+        action="store_true",
+        help="降级模式：跳过四脑管线，直接运行 ReActLoop（用于调试对比）",
+    )
     args = parser.parse_args()
 
     if args.no_color:
@@ -565,7 +763,7 @@ def main() -> None:
     signal.signal(signal.SIGINT, _interrupt.handle)
 
     try:
-        asyncio.run(_chat_loop(args.config))
+        asyncio.run(_chat_loop(args.config, direct_mode=args.direct))
     except KeyboardInterrupt:
         console.print("\n[yellow]再见！[/]")
 

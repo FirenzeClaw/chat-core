@@ -31,6 +31,7 @@ class Message:
     tool_call_id: str | None = None
     tool_calls: list[ToolCall] | None = None
     name: str | None = None
+    reasoning_content: str | None = None  # DeepSeek 推理链（必须在多轮对话中回传）
 
 
 class StreamEventType(Enum):
@@ -51,6 +52,7 @@ class StreamEvent:
     tool_call_args: str | None = None
     error: str | None = None
     usage: Usage | None = None
+    reasoning_content: str | None = None  # DeepSeek 推理链内容
 
 
 @dataclass

@@ -176,9 +176,14 @@ global/boredom/            # Boredom state
 
 | Field | Type | Description |
 |-------|------|-------------|
-| from_key | string | Source memory entry (full path: namespace/key) |
+| from_key | string | Source memory entry (`"namespace/key"` — see note below) |
 | to_key | string | Target memory entry |
 | relation | RelationType | "extends" \| "contradicts" \| "related_to" |
+
+> **Implementation note**: `from_key`/`to_key` use `"{namespace}/{key}"` composite format.
+> Since namespace itself may contain `/` (e.g. `"user/default"`), this format is ambiguous
+> for parsing. Internal code (`_spread_activate`) queries `memory_links` table directly with
+> separate namespace+key columns to avoid this issue.
 
 ---
 

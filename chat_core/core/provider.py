@@ -61,7 +61,7 @@ class ModelProvider:
             kwargs["temperature"] = temperature
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
-        if reasoning_effort and reasoning_effort != "off":
+        if reasoning_effort is not None:
             kwargs["reasoning_effort"] = reasoning_effort
 
         resp = await self._client.chat.completions.create(**kwargs)
@@ -117,7 +117,7 @@ class ModelProvider:
             kwargs["temperature"] = temperature
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
-        if reasoning_effort and reasoning_effort != "off":
+        if reasoning_effort is not None:
             kwargs["reasoning_effort"] = reasoning_effort
 
         try:
@@ -129,6 +129,7 @@ class ModelProvider:
         current_tool_id = ""
         current_tool_name = ""
         current_tool_args = ""
+        accumulated_reasoning = ""
         usage: Usage | None = None
 
         async for chunk in stream:
@@ -137,6 +138,10 @@ class ModelProvider:
 
             if delta and delta.content:
                 yield StreamEvent(type=StreamEventType.CONTENT_DELTA, content=delta.content)
+
+            # DeepSeek reasoning_effort: 捕获推理链内容
+            if delta and getattr(delta, "reasoning_content", None):
+                accumulated_reasoning += delta.reasoning_content
 
             if delta and delta.tool_calls:
                 for tc in delta.tool_calls:
@@ -180,7 +185,11 @@ class ModelProvider:
                 tool_call_args=current_tool_args,
             )
 
-        yield StreamEvent(type=StreamEventType.DONE, usage=usage)
+        yield StreamEvent(
+            type=StreamEventType.DONE,
+            usage=usage,
+            reasoning_content=accumulated_reasoning if accumulated_reasoning else None,
+        )
 
     # ── 序列化辅助 ──────────────────────────────────────────
 
@@ -204,6 +213,8 @@ class ModelProvider:
                 ]
             if m.name:
                 d["name"] = m.name
+            if m.reasoning_content:
+                d["reasoning_content"] = m.reasoning_content
             result.append(d)
         return result
 

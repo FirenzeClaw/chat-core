@@ -111,14 +111,28 @@ class TurnManager:
             personality_engine=personality_engine,
             attention_model=attention_model,
             correct_fn=self._issue_correction,
+            reply_callback=self._reply_callback,
+            stream_callback=self._stream_callback,
         )
 
         self._boredom_detector.set_on_trigger(self._proactive._on_boredom_trigger)
         self._boredom_detector.set_on_end_conversation(self._proactive._on_end_conversation_signal)
 
+        # 流式回调（由 CLI 注入）
+        self._stream_callback: Any = None
+        self._reply_callback: Any = None
+
     @property
     def event_bus(self) -> EventBus:
         return self._event_bus
+
+    def set_stream_callback(self, cb: Any) -> None:
+        """设置流式 LLM 输出回调（传递给子Session）"""
+        self._stream_callback = cb
+
+    def set_reply_callback(self, cb: Any) -> None:
+        """设置 send_reply 回调（传递给子Session）"""
+        self._reply_callback = cb
 
     # ── 主流程 ──────────────────────────────────────────────
 
@@ -324,6 +338,12 @@ class TurnManager:
         )
         register_sub_session_tools(tools, loop)
 
+        # 传递流式回调
+        if self._stream_callback:
+            loop.set_stream_callback(self._stream_callback)
+        if self._reply_callback:
+            loop.set_reply_callback(self._reply_callback)
+
         # 增强 recall 工具 — 连接真实记忆存储
         _enhance_recall(tools, self._memory, self._personality_engine)
 
@@ -504,6 +524,8 @@ class TurnManager:
             system_prompt=system_prompt,
             config=sub_config,
         )
+        if self._stream_callback:
+            loop.set_stream_callback(self._stream_callback)
         correction_task = "请根据上述错误审查结果，修正原始发言。"
         await loop.run(correction_task)
 

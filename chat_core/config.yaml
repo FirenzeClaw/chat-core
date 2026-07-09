@@ -39,7 +39,7 @@ brains:
     max_tokens: 512
     max_iter: 5
     max_context_tokens: 500000
-    reasoning_effort: max    # tool_choice=auto + reasoning 兼容
+    reasoning_effort: max
 
   action:
     api: deepseek
@@ -100,8 +100,8 @@ systems:
   boredom:
     tick_interval: 30
     decay_halflife: 600         # 半衰期(秒)
-    trigger_threshold: 0.30     # 触发无聊的 boredom 水平
-    end_conversation_threshold: 0.70
+    trigger_threshold: 0.70     # 触发主动行为的 boredom 水平（> 此值触发）
+    end_conversation_threshold: 0.90
 
   interest:
     topic_trigger_threshold: 3  # 同一话题提及次数
