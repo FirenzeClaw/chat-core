@@ -6,12 +6,12 @@
 
 ## 项目概述
 
-**chat-core** 是一个终端 AI 聊天 CLI，实现"四脑模型"人格模拟系统。核心理念：AI 不是被动 Q&A 机器，而是有独立判断力、情绪、记忆、会主动社交的聊天伙伴。
+**chat-core** 是一个终端 AI 聊天 CLI，实现"四脑模型"人格模拟系统。核心理念：AI 不是被动 Q&A 机器，而是有独立判断力、情绪、记忆、会主动社交的聊天伙伴。支持 CLI 终端交互和 QQ Bot 多用户模式。
 
 - **语言**: Python 3.12+
 - **范式**: asyncio 异步，四脑并发
-- **入口**: `chat_core/cli.py` → `chat-core` 命令（默认走 TurnManager 四脑管线，`--direct` 降级到直接 ReActLoop）
-- **定位**: 本地单用户 CLI，零外部编排依赖
+- **入口**: `chat_core/cli.py` → `chat-core` 命令（CLI 模式），`chat_core/qq_bot.py` → `chat-core-qq` 命令（QQ Bot 模式）
+- **定位**: 本地单用户 CLI + QQ 多用户 Bot，零外部编排依赖
 - **模型**: DeepSeek V4 (Pro 主脑 + Flash 子Session)，reasoning_effort 与 function calling 互斥（子Session 用纯文本兜底方案兼容）
 
 ---
@@ -49,6 +49,23 @@ CLI (_on_reply, _on_stream_event)
 子Session `_think()` 使用 `stream_chat()` 流式 LLM 输出，通过 `_on_stream_event` 推送到 `rich.Live` 面板。
 `reasoning_content`（DeepSeek 推理链）从流式 DONE event 捕获，存入 `Message.reasoning_content`，`_serialize_messages()` 回传。
 
+### QQ Bot 回调链路
+
+```
+QQ WebSocket (protocol.py)
+  → BotAdapter.process_message(ctx, send_fn)
+    → _get_or_create_sub_session() → ReActLoop (复用)
+    → _dual_recall() → LogicBrain.think_pre/inject ∥ EmotionBrain.think_pre/inject (异步后台)
+    → loop.set_reply_callback(_on_reply → send_fn → send_message REST API)
+    → loop.run(user_message)  ← 子 Session 立即启动，不等双脑
+    → _extract_facts() → 异步提取用户事实 → MemoryStore
+```
+
+QQ Bot 模式下：
+- 双脑注入**异步化**：子 Session 立即开始思考，主脑结果后台到达后追加到消息历史
+- 子 Session 回复速度 2-5s（不被双脑阻塞）
+- 每 turn 后异步提取用户事实写入 `user/{uid}/facts`
+
 ---
 
 ## 文件索引
@@ -59,10 +76,22 @@ CLI (_on_reply, _on_stream_event)
 |------|------|------------|
 | `chat_core/cli.py` | prompt_toolkit + rich TUI 入口 | `_chat_loop()`, `InterruptHandler`, `_show_mood()`, `_show_interests()` |
 | `chat_core/config.py` | YAML 配置 + .env 加载 + schema 校验 | `Config`, `get_config()`, `ConfigError` |
-| `chat_core/config.yaml` | 默认配置：模型、脑参数、系统参数 | brains.logic/emotion/sub_session/action |
+| `chat_core/config.yaml` | 默认配置：模型、脑参数、系统参数、QQ Bot | brains.logic/emotion/sub_session/action, qq_bot |
 | `chat_core/prompts/persona.yaml` | 人设定义 (~400 tokens) | identity, voice, style_guide |
 | `chat_core/prompts/rules.yaml` | 行为规范 (~200 tokens) | speech_protocol, reply_rules, safety |
 | `chat_core/prompts/tools.yaml` | 工具使用说明 (~300 tokens) | sub-session 五项工具 |
+
+### QQ Bot 集成 (`chat_core/qq/`)
+
+| 文件 | 职责 | 关键类/函数 |
+|------|------|------------|
+| `__init__.py` | 延迟导入，解耦 aiohttp 依赖 | — |
+| `protocol.py` | QQ WebSocket 协议 + REST API | `MessageContext`, `run_qq_loop()`, `send_message()`, `fetch_user_nickname()` |
+| `sessions.py` | 用户会话元数据 (TTL 过期) | `UserSession`, `SessionManager` |
+| `adapter.py` | QQ → 双主脑 + 子 Session 适配 | `BotAdapter.process_message()`, `_inject_async()`, `_extract_facts()` |
+| `race_tracker.py` | 竞态追踪（active_count → severity） | `RaceTracker.enter()/exit()` |
+| `subconscious.py` | 竞态驱动的潜意识注入调节 | `SubconsciousInjector.inject()` |
+| `qq_bot.py` | QQ Bot 入口 | `run_bot()`, `main()` |
 
 ### 核心引擎 (`chat_core/core/`)
 
@@ -206,7 +235,7 @@ LLM 返回 NonStreamResult {content, tool_calls}
 ## 测试
 
 ```bash
-# 单元测试 (84 tests)
+# 单元测试 (95 tests)
 python -m pytest tests/ -v
 
 # Spec E2E 测试 (19 scenarios)
@@ -226,6 +255,8 @@ python -m pytest tests/ --cov=chat_core --cov-report=term
 | `tests/test_config.py` | Config 加载/校验/环境变量 |
 | `tests/test_brain.py` | Brain 创建/池并发/限速器 |
 | `tests/test_phase6_emotion.py` | EmotionEngine/PersonalityEngine/AttentionModel |
+| `tests/test_qq_protocol.py` | MessageContext/事件解析/去重 |
+| `tests/test_qq_sessions.py` | UserSession/SessionManager TTL |
 | `tests/spec_e2e_test.py` | 全量 Spec 19 场景 (需要 API key) |
 
 ---
@@ -254,8 +285,9 @@ python -m pytest tests/ --cov=chat_core --cov-report=term
 
 ## 设计文档
 
-完整规格、计划、数据模型见 `specs/001-chat-core-cli/`：
+完整规格、计划、数据模型见 `specs/`：
 
+**001-chat-core-cli**:
 | 文档 | 路径 |
 |------|------|
 | 功能规格 (37 FR) | `specs/001-chat-core-cli/spec.md` |
@@ -264,5 +296,18 @@ python -m pytest tests/ --cov=chat_core --cov-report=term
 | 数据模型 + 状态机 | `specs/001-chat-core-cli/data-model.md` |
 | 技术决策 | `specs/001-chat-core-cli/research.md` |
 | CLI 接口契约 | `specs/001-chat-core-cli/contracts/cli-contract.md` |
+
+**002-qq-bot-integration**:
+| 文档 | 路径 |
+|------|------|
+| 功能规格 (25 FR) | `specs/002-qq-bot-integration/spec.md` |
+| 实施计划 (6 Phase) | `specs/002-qq-bot-integration/plan.md` |
+| 任务列表 (49 tasks) | `specs/002-qq-bot-integration/tasks.md` |
+| 数据模型 + 状态机 | `specs/002-qq-bot-integration/data-model.md` |
+| 技术决策 | `specs/002-qq-bot-integration/research.md` |
+| QQ Bot 行为契约 | `specs/002-qq-bot-integration/contracts/qq-bot-contract.md` |
+
+| 文档 | 路径 |
+|------|------|
 | 原始架构设计 | `chat-core-design.md` |
 | Agent 状态机模式分析 | `chat-cli-research.md` §Agent 状态机核心模式 |

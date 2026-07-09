@@ -126,6 +126,26 @@ history:
   path: ./data/history/
   format: jsonl
 
+# QQ Bot 配置（可选，仅 qq_bot 入口使用）
+qq_bot:
+  appid: ${QQ_BOT_APPID}
+  secret: ${QQ_BOT_SECRET}
+  ws_url: wss://api.sgroup.qq.com/websocket
+  
+  # 回复控制
+  group_reply_enabled: true       # 群聊 @ 回复
+  c2c_reply_enabled: true         # 单聊回复
+  passive_observe: true           # 群聊普通消息仅旁听记忆
+  
+  # 并发控制
+  max_concurrent_turns: 3
+  
+  # 会话
+  session_ttl: 3600               # 用户会话过期秒数
+  
+  # HTTP 健康检查
+  health_port: 18090
+
 # 安全
 safety:
   send_reply_max_length: 500

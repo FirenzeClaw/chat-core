@@ -1,5 +1,37 @@
 # Changelog
 
+## [Unreleased] — 2026-07-09 (QQ Bot 集成)
+
+### Added
+
+- **QQ Bot 接入**: 新增 `chat-core-qq` 命令，chat-core 作为 QQ 机器人运行
+- **QQ WebSocket 协议层** (`qq/protocol.py`): 状态机 (hello→identify→running)、Token 管理、消息去重、REST API 发送（含错误码分类重试）
+- **全局双主脑 + 多子 Session** (`qq/adapter.py`): LogicBrain + EmotionBrain 全局共享，每对话者独立 ReActLoop
+- **竞态追踪** (`qq/race_tracker.py`): 活跃子 Session 计数 → severity (low/medium/high) → EmotionEngine 烦躁加速
+- **潜意识注入调节** (`qq/subconscious.py`): 按竞态程度截断注入上下文（顾此薄彼效应）
+- **双脑异步注入**: 子 Session 立即启动回复，双脑 recall+inject 后台异步运行，首段回复 2-5s
+- **用户画像自动构建**: 每 turn 后异步 LLM 提取用户事实 → `user/{uid}/facts`
+- **群聊旁听记忆**: 非 @ 消息写入 `user/{uid}/group/{gid}/observations`，不触发回复
+- **用户会话管理** (`qq/sessions.py`): TTL 过期，per-user asyncio.Lock 串行
+- **消息分段发送**: send_reply 回调直接调 QQ API，LLM 多段回复逐条发送
+- **健康检查端点**: `:18090/health`
+- QQ Bot 配置节: `config.yaml` → `qq_bot`
+
+### Changed
+
+- `config.yaml`: 新增 `qq_bot` 配置节
+- `config.py`: 新增 `qq_config()` 方法
+- `pyproject.toml`: 新增 `aiohttp` 依赖、`chat-core-qq` 入口、`chat_core.qq` 包
+- `qq_bot.py`: 日志同时输出到 `data/qq_bot.log` 文件
+
+### Tests
+
+- `tests/test_qq_protocol.py` (12 tests): MessageContext/事件解析/去重
+- `tests/test_qq_sessions.py` (12 tests): UserSession/SessionManager TTL
+- 全量回归: 95 tests passed
+
+---
+
 ## [Unreleased] — 2026-07-09 (streaming + memory pipeline session)
 
 ### Added

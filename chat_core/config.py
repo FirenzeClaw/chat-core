@@ -208,6 +208,9 @@ class Config:
     def attention_config(self) -> dict[str, Any]:
         return self.systems.get("attention", {})
 
+    def qq_config(self) -> dict[str, Any]:
+        return self._data.get("qq_bot", {})
+
     # ── 单例 ────────────────────────────────────────────────
 
     @classmethod
