@@ -1,0 +1,135 @@
+# chat-core 配置
+version: 1
+
+# LLM API 配置
+apis:
+  deepseek:
+    provider: deepseek
+    base_url: https://api.deepseek.com/v1
+    api_key: ${DEEPSEEK_API_KEY}
+    capabilities: []           # [vision, function_calling]
+  stepfun:
+    provider: stepfun
+    base_url: https://api.stepfun.com/v1
+    api_key: ${STEPFUN_API_KEY}
+    capabilities: [vision]
+
+# 各脑模型配置
+brains:
+  logic:
+    api: deepseek
+    model: deepseek-v4-pro
+    temperature: 0.3
+    max_tokens: 512
+    max_context_tokens: 700000
+    reasoning_effort: max
+
+  emotion:
+    api: deepseek
+    model: deepseek-v4-pro
+    temperature: 0.3
+    max_tokens: 512
+    max_context_tokens: 700000
+    reasoning_effort: max
+
+  sub_session:
+    api: deepseek
+    model: deepseek-v4-flash
+    temperature: 0.8         # 运行时由 personality.playfulness 调制
+    max_tokens: 512
+    max_iter: 5
+    max_context_tokens: 500000
+    reasoning_effort: max    # tool_choice=auto + reasoning 兼容
+
+  action:
+    api: deepseek
+    model: deepseek-v4-flash
+    temperature: 0.5
+    max_tokens: 256
+    max_concurrent: 2
+    max_context_tokens: 500000
+    reasoning_effort: medium
+
+# 多模态降级链
+multimodal:
+  enabled: true
+  chain: [stepfun, deepseek]  # 按顺序尝试
+
+# 内化系统参数
+systems:
+  emotion:
+    tick_interval: 10
+    decay:
+      surprise: 30
+      confusion: 120
+      fear: 300
+      anger: 600
+      disgust: 600
+      joy: 600
+      sadness: 900
+      interest: 1200
+      anticipation: 1800
+      trust: 3600
+    contagion_strength: 0.1
+    introspect_threshold: 0.3   # 自省触发：双脑余弦距离
+
+  personality:
+    initial:
+      curiosity: 0.7
+      sociability: 0.8
+      playfulness: 0.6
+      empathy: 0.5
+      assertiveness: 0.3
+      creativity: 0.6
+      impulsiveness: 0.2
+      loyalty: 0.75
+
+  memory:
+    db_path: ./data/memory.db
+    retrieval:
+      fts5_top_n: 20
+      llm_rerank_top_n: 5
+      llm_rerank_timeout: 1.0
+      spread_activation_depth: 2
+    decay:
+      detail_auto_migrate_days: 60
+      gist_expire_salience_5: 90
+      gist_expire_salience_7: 135
+      gist_expire_salience_10: 180
+
+  boredom:
+    tick_interval: 30
+    decay_halflife: 600         # 半衰期(秒)
+    trigger_threshold: 0.30     # 触发无聊的 boredom 水平
+    end_conversation_threshold: 0.70
+
+  interest:
+    topic_trigger_threshold: 3  # 同一话题提及次数
+    topic_weight_increment: 0.1
+    decay_per_hour: 0.05
+
+  attention:
+    baseline:
+      logic: {focus: 0.8, dominance: 0.7}
+      emotion: {focus: 0.7, dominance: 0.5}
+      sub: {focus: 0.9, dominance: 0.6}
+    drift_decay_rate: 0.01      # 每秒衰减
+
+# Prompt 文件路径
+prompts:
+  persona: ./prompts/persona.yaml
+  rules: ./prompts/rules.yaml
+  tools: ./prompts/tools.yaml
+
+# 历史记录
+history:
+  path: ./data/history/
+  format: jsonl
+
+# 安全
+safety:
+  send_reply_max_length: 500
+  search_rate_limit: [5, 60]    # 5次/60秒
+  search_cooldown: 2            # 每次搜索间隔(秒)
+  web_fetch_timeout: 10
+  web_fetch_max_size: 102400    # 100KB

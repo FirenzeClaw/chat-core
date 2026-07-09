@@ -1,0 +1,41 @@
+[project]
+name = "chat-core"
+version = "0.1.0"
+description = "四脑模型 AI 聊天 CLI — 有记忆、有情绪、有判断力的终端 AI 伙伴"
+requires-python = ">=3.12"
+readme = "chat-core-design.md"
+license = { text = "MIT" }
+dependencies = [
+    "openai>=1.0",
+    "prompt-toolkit>=3.0",
+    "rich>=13.0",
+    "aiosqlite>=0.20",
+    "pyyaml>=6.0",
+    "duckduckgo-search>=7.0",
+    "jieba>=0.42",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "mypy>=1.0",
+]
+
+[project.scripts]
+chat-core = "chat_core.cli:main"
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["chat_core", "chat_core.core", "chat_core.systems"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
