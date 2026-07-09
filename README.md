@@ -23,6 +23,8 @@
 
 ## 架构
 
+### CLI 模式（单用户）
+
 ```
 用户消息
   │
@@ -40,6 +42,26 @@
   │         ↓ 双脑审查
   ├─ 逻辑主脑: 事实审查 ──→ 权重投票
   └─ 情感主脑: 语气审查 ──→ 纠正/沉默/拧巴
+```
+
+### QQ Bot 模式（多用户 — 一个人与多人聊）
+
+```
+QQ WebSocket 消息到达
+  │
+  ├─ 全局双主脑 (LogicBrain + EmotionBrain) ─ 共享，异步后台注入
+  ├─ 竞态追踪 (RaceTracker) ─ 活跃子 Session 计数 → 烦躁加速
+  ├─ 潜意识注入 (SubconsciousInjector) ─ 按竞态度截断上下文
+  │
+  └─ 每对话者独立子 Session (ReActLoop)
+       │  立即启动回复 (2-5s)，不等双脑
+       ├─ ① send_reply → 直接发 QQ
+       ├─ ② wait → 停顿
+       ├─ ③ send_reply → 接着说
+       ├─ ④ recall → 查 MemoryStore
+       └─ ⑤ inner_thoughts → 结束
+            │
+            └─ 归档 + 异步提取用户事实 → MemoryStore
 ```
 
 ## 特性
