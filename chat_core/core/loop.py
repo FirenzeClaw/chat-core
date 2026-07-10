@@ -393,8 +393,16 @@ class ReActLoop:
 
 # ── 子Session 工具注册 ────────────────────────────────────
 
-def register_sub_session_tools(registry: ToolRegistry, loop: ReActLoop, memory_store: Any = None) -> None:
-    """向 ToolRegistry 注册子Session 的五项基础工具"""
+def register_sub_session_tools(
+    registry: ToolRegistry,
+    loop: ReActLoop,
+    memory_store: Any = None,
+    chain_config: Any = None,  # Spec 003: RecallChainConfig | None
+) -> None:
+    """向 ToolRegistry 注册子Session 的五项基础工具。
+    
+    Spec 003: chain_config 为 RecallChainConfig 时，recall 工具使用联锁检索。
+    """
 
     registry.register(ToolDefinition(
         name="send_reply",
@@ -426,7 +434,7 @@ def register_sub_session_tools(registry: ToolRegistry, loop: ReActLoop, memory_s
 
     registry.register(ToolDefinition(
         name="recall",
-        description="从记忆中检索相关信息。只读。",
+        description="从记忆中检索信息。会自动追溯关联记忆。只读。",
         parameters={
             "type": "object",
             "properties": {
@@ -434,7 +442,7 @@ def register_sub_session_tools(registry: ToolRegistry, loop: ReActLoop, memory_s
             },
             "required": ["query"],
         },
-        fn=lambda args, ctx: _handle_recall(args, memory_store),
+        fn=lambda args, ctx: _handle_recall(args, memory_store, chain_config),
         parallel_safe=True,
     ))
 
@@ -497,12 +505,21 @@ async def _handle_wait(args: dict, loop: ReActLoop | None = None) -> str:
     return json.dumps({"waited": seconds})
 
 
-async def _handle_recall(args: dict, memory_store: Any = None) -> str:
-    """从记忆中检索信息。如果 memory_store 可用则执行真实检索，否则返回空。"""
+async def _handle_recall(args: dict, memory_store: Any = None, chain_config: Any = None) -> str:
+    """从记忆中检索信息。
+    
+    Spec 003: 若提供 chain_config，使用 search_chained 联锁检索 + 自然语言回溯。
+    否则使用旧 search() API 返回 JSON。
+    """
     query = str(args.get("query", ""))
     if memory_store is None:
         return json.dumps({"results": [], "query": query, "note": "记忆系统未初始化"})
     try:
+        # Spec 003: 联锁检索
+        if chain_config is not None:
+            chained = await memory_store.search_chained(query, chain_config)
+            return memory_store._format_recall_result(chained)
+        # 旧 API 降级
         entries = await memory_store.search(query, top_n=5)
         results = [
             {"key": f"{e.namespace}/{e.key}", "value": e.value}

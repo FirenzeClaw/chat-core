@@ -260,6 +260,10 @@ class MemoryEntry:
     updated_at: datetime = field(default_factory=datetime.now)
     expires_at: datetime | None = None
     ttl: int | None = None
+    # Spec 003: recall 深刻化字段
+    access_count: int = 0
+    last_access: str | None = None
+    decay_curve: str = "standard"
 
 
 @dataclass
@@ -267,6 +271,43 @@ class MemoryLink:
     from_key: str = ""
     to_key: str = ""
     relation: RelationType = RelationType.RELATED_TO
+
+
+# ── Spec 003: 记忆联锁 ──────────────────────────────────────
+
+@dataclass
+class ChainedMemory:
+    """联锁记忆条目：MemoryEntry + 联锁元数据"""
+    entry: MemoryEntry
+    chain_level: int = 0          # 0=direct, 1=links, 2=topic_tags, 3=entity, 4=namespace
+    chain_parent_key: str | None = None  # direct 时为 None
+    relevance_score: float = 0.0
+
+
+@dataclass
+class RecallChainConfig:
+    """recall 联锁配置"""
+    top_n: int                    # FTS5 主检索返回条数
+    extensions: list[int]         # 每个 rank 的延伸数量 [N₀, N₁, ...]
+    max_per_level: int            # 每级 fallback 单次取出的上限
+    namespace_prefix: str | None = None  # 命名空间限制
+
+
+# 主脑配置: top 5 + 延伸 3/2/2/1/0 = 最多 13 条
+LOGIC_BRAIN_CHAIN_CONFIG = RecallChainConfig(
+    top_n=5,
+    extensions=[3, 2, 2, 1, 0],
+    max_per_level=3,
+    namespace_prefix=None,
+)
+
+# 子Session 配置: top 3 + 延伸 2/1/0 = 最多 6 条
+SUB_SESSION_CHAIN_CONFIG = RecallChainConfig(
+    top_n=3,
+    extensions=[2, 1, 0],
+    max_per_level=2,
+    namespace_prefix=None,
+)
 
 
 # ── 情绪与人格 ──────────────────────────────────────────────

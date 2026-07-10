@@ -42,7 +42,7 @@ class RaceTracker:
         if self._emotion_engine:
             try:
                 factor = 0.1 * self._active_count
-                self._emotion_engine.accelerate("anger", factor)
+                self._emotion_engine.accelerate("sub", "anger", factor)
             except Exception:
                 pass
         logger.debug("RaceTracker enter: count=%d severity=%s", self._active_count, self.severity)

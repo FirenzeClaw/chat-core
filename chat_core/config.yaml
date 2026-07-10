@@ -137,9 +137,6 @@ qq_bot:
   c2c_reply_enabled: true         # 单聊回复
   passive_observe: true           # 群聊普通消息仅旁听记忆
   
-  # 并发控制
-  max_concurrent_turns: 3
-  
   # 会话
   session_ttl: 3600               # 用户会话过期秒数
   

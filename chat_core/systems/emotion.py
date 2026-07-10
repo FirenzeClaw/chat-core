@@ -193,6 +193,14 @@ class EmotionEngine:
             raise ValueError(f"Unknown dimension: {dim}. Must be one of {EMOTION_DIMS}")
         setattr(self._states[brain], dim, _clamp(value))
 
+    def accelerate(self, brain: str, dim: str, delta: float) -> None:
+        """竞态驱动情感加速：在当前值上增加 delta（自动钳制到 [0, 1]）。
+        
+        用于多线对话竞态场景——同时活跃对话越多，"烦躁"维度增长越快。
+        """
+        current = getattr(self._states[brain], dim, 0.0)
+        self.set_dimension(brain, dim, current + delta)
+
     def get_emotion_summary(self, brain: str) -> str:
         """获取指定大脑的情绪摘要文本，用于注入 sub_session prompt。
 

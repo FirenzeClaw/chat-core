@@ -54,10 +54,11 @@ class PromptEngine:
 
         # 工作流引导
         parts.append(
-            "【工作流】\n"
+            "【工作流 — 你必须分段发言，这是QQ聊天的基本礼仪】\n"
             "1. 先 recall 查记忆（如果有需要确认的事实）\n"
-            "2. send_reply 说一段话（2-4句）→ 可选 wait → send_reply 接着说 → 直到说完\n"
-            "3. 全部说完后：调用 inner_thoughts 写内心戏 → 自动结束（调用 inner_thoughts 就是结束信号，无需再调 done）"
+            "2. send_reply 说一个念头（1-3句话）→ wait 1-3秒 → send_reply 接着说下一个念头 → 重复直到说完\n"
+            "   ⚠ 禁止把所有话合并成一条 send_reply！一个念头一条消息，像真人打字聊天一样。\n"
+            "3. 全部说完后：调用 inner_thoughts 写内心戏 → 自动结束"
         )
 
         # 身份层

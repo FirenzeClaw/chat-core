@@ -20,7 +20,7 @@ from chat_core.core.loop import ReActLoop, SubSessionConfig, register_sub_sessio
 from chat_core.core.provider import ModelProvider
 from chat_core.core.prompt_engine import PromptEngine
 from chat_core.core.tools import ToolRegistry
-from chat_core.core.types import MemoryEntry, Message
+from chat_core.core.types import MemoryEntry, Message, RecallChainConfig, SUB_SESSION_CHAIN_CONFIG
 from chat_core.systems.memory import MemoryStore
 from chat_core.systems.emotion import EmotionEngine
 from chat_core.systems.personality import PersonalityEngine
@@ -62,6 +62,12 @@ class BotAdapter:
         self._sessions = SessionManager()
         self._user_locks: dict[str, asyncio.Lock] = {}
 
+        # QQ Bot 回复开关 (FR-22)
+        qq_cfg = get_config().qq_config()
+        self._c2c_reply_enabled: bool = qq_cfg.get("c2c_reply_enabled", True)
+        self._group_reply_enabled: bool = qq_cfg.get("group_reply_enabled", True)
+        self._passive_observe_enabled: bool = qq_cfg.get("passive_observe", True)
+
     # ── 公共接口 ────────────────────────────────────────────
 
     async def process_message(
@@ -69,8 +75,16 @@ class BotAdapter:
         send_fn: Any = None,
     ) -> list[str]:
         """处理一条 QQ 消息。send_fn 传入时，send_reply 逐段直接发送。"""
+        # 私聊开关关闭 → 静默跳过
+        if not ctx.is_group and not self._c2c_reply_enabled:
+            return []
+        # 群@开关关闭 → 静默跳过
+        if ctx.is_group and ctx.is_at and not self._group_reply_enabled:
+            return []
+        # 群聊旁听 (非@普通消息)
         if ctx.is_group and not ctx.is_at and not ctx.is_direct:
-            await self._passive_observe(ctx)
+            if self._passive_observe_enabled:
+                await self._passive_observe(ctx)
             return []
 
         key = ctx.session_key
@@ -90,7 +104,7 @@ class BotAdapter:
             await self._ensure_profile(ctx)
 
         # 复用或创建子 Session
-        loop = self._get_or_create_sub_session(ctx.session_key)
+        loop = self._get_or_create_sub_session(ctx.session_key, ctx.user_id, ctx.scene)
 
         # 双主脑 recall + inject 异步启动（不阻塞子 Session）
         severity = self._race_tracker.severity
@@ -144,8 +158,13 @@ class BotAdapter:
 
     # ── 子 Session 复用 ─────────────────────────────────────
 
-    def _get_or_create_sub_session(self, session_key: str) -> ReActLoop:
-        """获取或创建子 Session。复用同一对话者的实例以保留上下文。"""
+    def _get_or_create_sub_session(
+        self, session_key: str, user_id: str = "", scene: str = "c2c",
+    ) -> ReActLoop:
+        """获取或创建子 Session。复用同一对话者的实例以保留上下文。
+        
+        Spec 003: 为子Session 构造 RecallChainConfig，限制 namespace 为 user/{uid}/* + short_term/*。
+        """
         if session_key in self._sub_sessions:
             return self._sub_sessions[session_key]
 
@@ -164,7 +183,16 @@ class BotAdapter:
             config=sub_config,
             attention_model=AttentionModel(),
         )
-        register_sub_session_tools(tools, loop)
+
+        # Spec 003: 构造子Session 联锁配置
+        chain_config = RecallChainConfig(
+            top_n=SUB_SESSION_CHAIN_CONFIG.top_n,
+            extensions=list(SUB_SESSION_CHAIN_CONFIG.extensions),
+            max_per_level=SUB_SESSION_CHAIN_CONFIG.max_per_level,
+            namespace_prefix=f"user/{user_id}" if user_id else None,
+        )
+        register_sub_session_tools(tools, loop, self._memory, chain_config=chain_config)
+
         from chat_core.systems.proactive import _enhance_recall
         _enhance_recall(tools, self._memory, self._personality_engine)
 
@@ -212,9 +240,6 @@ class BotAdapter:
                 )
         except Exception:
             logger.exception("异步注入失败: user=%s", ctx.user_id[:12])
-        except Exception:
-            logger.exception("双主脑 recall 失败")
-            return ""
 
     # ── 用户画像 ────────────────────────────────────────────
 

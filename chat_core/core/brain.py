@@ -13,6 +13,8 @@ from chat_core.core.prompt_engine import PromptEngine
 from chat_core.core.tools import ToolDefinition, ToolRegistry, ToolContext
 from chat_core.core.types import (
     ActionResult,
+    ChainedMemory,
+    LOGIC_BRAIN_CHAIN_CONFIG,
     MemoryEntry,
     Message,
     NonStreamResult,
@@ -46,6 +48,8 @@ class LogicBrain:
         self._history: list[Message] = []
         self._max_context_tokens = self._get_max_context()
         self._compression_applied = 0
+        # Spec 003: 存储最近一次联锁 recall 结果，供 think_inject 格式化使用
+        self._last_chained_recall: list[ChainedMemory] = []
 
     def _get_max_context(self) -> int:
         from chat_core.config import get_config
@@ -211,13 +215,22 @@ class LogicBrain:
         memories: list[MemoryEntry],
         direction: str,
     ) -> dict[str, Any]:
-        """Phase 2: 生成 inject_to_sub 调用"""
-        memory_texts = [f"- {m.namespace}/{m.key}: {json.dumps(m.value, ensure_ascii=False)[:200]}" for m in memories[:5]]
+        """Phase 2: 生成 inject_to_sub 调用。
+        
+        Spec 003: 使用 _format_recall_result 将联锁记忆转为自然语言回溯。
+        """
+        # Spec 003: 自然语言回溯
+        if self._last_chained_recall:
+            memory_text = self._memory._format_recall_result(self._last_chained_recall)
+        else:
+            # 降级：无联锁结果时使用原始格式
+            memory_texts = [f"- {m.namespace}/{m.key}: {json.dumps(m.value, ensure_ascii=False)[:200]}" for m in memories[:5]]
+            memory_text = "\n".join(memory_texts)
 
         self._history.append(Message(role="user", content=(
             f"用户说: {user_message}\n"
             f"方向判断: {direction}\n"
-            f"相关记忆:\n" + "\n".join(memory_texts) +
+            f"相关记忆:\n{memory_text}"
             f"\n\n请调用 inject_to_sub 注入上下文和方向指导。"
         )))
 
@@ -327,11 +340,15 @@ class LogicBrain:
         return memories[:5]
 
     async def _execute_recall(self, tc: ToolCall) -> list[MemoryEntry]:
+        """Spec 003: 使用 search_chained() 联锁检索，保持返回 list[MemoryEntry]"""
         try:
             args = json.loads(tc.function_args)
             query = str(args.get("query", ""))
-            return await self._memory.search(query, top_n=10)
+            chained = await self._memory.search_chained(query, LOGIC_BRAIN_CHAIN_CONFIG)
+            self._last_chained_recall = chained
+            return [cm.entry for cm in chained]
         except Exception:
+            self._last_chained_recall = []
             return []
 
     async def _do_memory_save(self, args: dict) -> str:

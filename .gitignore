@@ -11,3 +11,5 @@ build/
 .pytest_cache/
 .mypy_cache/
 .env
+deploy_key*
+.kimi-tunnel/

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from datetime import datetime
@@ -10,7 +11,7 @@ from typing import Any
 
 import aiosqlite
 
-from chat_core.core.types import MemoryEntry, MemoryLink, RelationType
+from chat_core.core.types import MemoryEntry, MemoryLink, RelationType, ChainedMemory, RecallChainConfig
 
 # 中文分词（可选依赖）
 try:
@@ -49,6 +50,7 @@ class MemoryStore:
         await self._db.execute("PRAGMA foreign_keys=ON")
         await self._db.execute("PRAGMA cache_size=-8000")        # 8MB 缓存
         await self._create_tables()
+        await self._migrate_schema_003()
         await self._db.commit()
 
     async def close(self) -> None:
@@ -146,6 +148,19 @@ class MemoryStore:
                 "SELECT rowid, namespace, key, value, topic_tags, entity_type FROM memories"
             )
 
+    async def _migrate_schema_003(self) -> None:
+        """Spec 003: 添加 access_count, last_access, decay_curve 列（含默认值，对现存行透明）"""
+        assert self._db
+        # 检查列是否已存在
+        cursor = await self._db.execute("PRAGMA table_info('memories')")
+        columns = {row[1] for row in await cursor.fetchall()}
+        if "access_count" not in columns:
+            await self._db.execute("ALTER TABLE memories ADD COLUMN access_count INTEGER DEFAULT 0")
+        if "last_access" not in columns:
+            await self._db.execute("ALTER TABLE memories ADD COLUMN last_access TEXT")
+        if "decay_curve" not in columns:
+            await self._db.execute("ALTER TABLE memories ADD COLUMN decay_curve TEXT DEFAULT 'standard'")
+
     # ── CRUD ────────────────────────────────────────────────
 
     async def save(self, entry: MemoryEntry) -> None:
@@ -156,8 +171,9 @@ class MemoryStore:
         await self._db.execute(
             """INSERT OR REPLACE INTO memories
                (namespace, key, value, layer, salience, entity_type, topic_tags,
-                emotional_tags, created_at, updated_at, expires_at, ttl)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                emotional_tags, created_at, updated_at, expires_at, ttl,
+                access_count, last_access, decay_curve)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 entry.namespace, entry.key,
                 json.dumps(entry.value, ensure_ascii=False),
@@ -168,6 +184,9 @@ class MemoryStore:
                 now,
                 entry.expires_at.isoformat() if isinstance(entry.expires_at, datetime) and entry.expires_at else None,
                 entry.ttl,
+                entry.access_count,
+                entry.last_access,
+                entry.decay_curve,
             ),
         )
         await self._db.commit()
@@ -396,6 +415,469 @@ class MemoryStore:
 
         return sorted(entries, key=_cluster_score, reverse=True)
 
+    # ── Spec 003: 记忆联锁 ──────────────────────────────────
+
+    async def _extend_by_links(
+        self, entry: MemoryEntry, remaining: int,
+        max_per_level: int, namespace_prefix: str | None,
+    ) -> list[ChainedMemory]:
+        """L1: 从 memory_links 显式关联延伸"""
+        assert self._db
+        results: list[ChainedMemory] = []
+        if remaining <= 0:
+            return results
+
+        take = min(remaining, max_per_level)
+        sql = (
+            "SELECT m.* FROM memories m "
+            "JOIN memory_links ml ON "
+            "  (ml.to_namespace = m.namespace AND ml.to_key = m.key) "
+            "WHERE ml.from_namespace = ? AND ml.from_key = ? "
+            "AND NOT (m.namespace = ? AND m.key = ?)"
+        )
+        params: list[Any] = [entry.namespace, entry.key, entry.namespace, entry.key]
+        if namespace_prefix:
+            sql += " AND m.namespace LIKE ?"
+            params.append(f"{namespace_prefix}%")
+        sql += f" LIMIT {take}"
+
+        cursor = await self._db.execute(sql, params)
+        rows = await cursor.fetchall()
+        for row in rows:
+            e = self._row_to_entry(row)
+            if not self._is_expired(e):
+                results.append(ChainedMemory(
+                    entry=e, chain_level=1,
+                    chain_parent_key=f"{entry.namespace}/{entry.key}",
+                    relevance_score=0.8,
+                ))
+        return results
+
+    async def _extend_by_tags(
+        self, entry: MemoryEntry, remaining: int,
+        max_per_level: int, namespace_prefix: str | None,
+    ) -> list[ChainedMemory]:
+        """L2: 按 topic_tags 交集延伸"""
+        assert self._db
+        results: list[ChainedMemory] = []
+        if remaining <= 0 or not entry.topic_tags:
+            return results
+
+        take = min(remaining, max_per_level)
+        # 构建 topic_tags LIKE 条件
+        tag_conditions = " OR ".join(["m.topic_tags LIKE ?" for _ in entry.topic_tags])
+        sql = (
+            f"SELECT m.* FROM memories m WHERE ({tag_conditions}) "
+            "AND NOT (m.namespace = ? AND m.key = ?)"
+        )
+        params: list[Any] = [f'%"{t}"%' for t in entry.topic_tags]
+        params.extend([entry.namespace, entry.key])
+        if namespace_prefix:
+            sql += " AND m.namespace LIKE ?"
+            params.append(f"{namespace_prefix}%")
+        sql += f" LIMIT {take}"
+
+        cursor = await self._db.execute(sql, params)
+        rows = await cursor.fetchall()
+        for row in rows:
+            e = self._row_to_entry(row)
+            if not self._is_expired(e):
+                results.append(ChainedMemory(
+                    entry=e, chain_level=2,
+                    chain_parent_key=f"{entry.namespace}/{entry.key}",
+                    relevance_score=0.6,
+                ))
+        return results
+
+    async def _extend_by_entity(
+        self, entry: MemoryEntry, remaining: int,
+        max_per_level: int, namespace_prefix: str | None,
+    ) -> list[ChainedMemory]:
+        """L3: 按 entity_type 同类型延伸"""
+        assert self._db
+        results: list[ChainedMemory] = []
+        if remaining <= 0 or not entry.entity_type:
+            return results
+
+        take = min(remaining, max_per_level)
+        sql = (
+            "SELECT m.* FROM memories m WHERE m.entity_type = ? "
+            "AND NOT (m.namespace = ? AND m.key = ?)"
+        )
+        params: list[Any] = [entry.entity_type, entry.namespace, entry.key]
+        if namespace_prefix:
+            sql += " AND m.namespace LIKE ?"
+            params.append(f"{namespace_prefix}%")
+        sql += f" LIMIT {take}"
+
+        cursor = await self._db.execute(sql, params)
+        rows = await cursor.fetchall()
+        for row in rows:
+            e = self._row_to_entry(row)
+            if not self._is_expired(e):
+                results.append(ChainedMemory(
+                    entry=e, chain_level=3,
+                    chain_parent_key=f"{entry.namespace}/{entry.key}",
+                    relevance_score=0.4,
+                ))
+        return results
+
+    async def _extend_by_namespace(
+        self, entry: MemoryEntry, remaining: int,
+        max_per_level: int, namespace_prefix: str | None,
+    ) -> list[ChainedMemory]:
+        """L4: 按 namespace 同前缀延伸"""
+        assert self._db
+        results: list[ChainedMemory] = []
+        if remaining <= 0:
+            return results
+
+        take = min(remaining, max_per_level)
+        # 取 entry.namespace 的上层前缀 (如 user/uid → user/uid/%)
+        ns_parts = entry.namespace.rsplit("/", 1)
+        ns_prefix = ns_parts[0] + "/%" if len(ns_parts) > 1 else entry.namespace + "%"
+
+        sql = (
+            "SELECT m.* FROM memories m WHERE m.namespace LIKE ? "
+            "AND NOT (m.namespace = ? AND m.key = ?)"
+        )
+        params: list[Any] = [ns_prefix, entry.namespace, entry.key]
+        if namespace_prefix:
+            sql += " AND m.namespace LIKE ?"
+            params.append(f"{namespace_prefix}%")
+        sql += f" LIMIT {take}"
+
+        cursor = await self._db.execute(sql, params)
+        rows = await cursor.fetchall()
+        for row in rows:
+            e = self._row_to_entry(row)
+            if not self._is_expired(e):
+                results.append(ChainedMemory(
+                    entry=e, chain_level=4,
+                    chain_parent_key=f"{entry.namespace}/{entry.key}",
+                    relevance_score=0.2,
+                ))
+        return results
+
+    async def _extend_chain(
+        self, entry: MemoryEntry, target_n: int,
+        namespace_prefix: str | None, max_per_level: int,
+    ) -> list[ChainedMemory]:
+        """4 级 fallback 联锁延伸。断链静默跳过，自动降级。"""
+        results: list[ChainedMemory] = []
+
+        for level_fn in [
+            self._extend_by_links,
+            self._extend_by_tags,
+            self._extend_by_entity,
+            self._extend_by_namespace,
+        ]:
+            if len(results) >= target_n:
+                break
+            remaining = target_n - len(results)
+            try:
+                level_results = await level_fn(entry, remaining, max_per_level, namespace_prefix)
+                results.extend(level_results)
+            except Exception:
+                # 断链静默跳过，自动降级到下一级
+                pass
+
+        return results[:target_n]
+
+    def _dedup_by_quality(self, all_results: list[ChainedMemory]) -> list[ChainedMemory]:
+        """全局去重：同 key 保留 chain_level 最小的（links > tags > entity > namespace）"""
+        seen: dict[str, ChainedMemory] = {}
+        for cm in all_results:
+            key = f"{cm.entry.namespace}/{cm.entry.key}"
+            if key not in seen or cm.chain_level < seen[key].chain_level:
+                seen[key] = cm
+        # 排序: chain_level (direct first) → relevance_score desc
+        return sorted(seen.values(), key=lambda x: (x.chain_level, -x.relevance_score))
+
+    # ── Spec 003: 自然语言回溯 ──────────────────────────────
+
+    _CONNECTORS = [
+        "还想起", "哦对", "说到这个",
+        "这让我想起", "顺便一提", "对了",
+        "说起来", "那次也是",
+    ]
+
+    _NO_MEMORY_PHRASES = [
+        "目前没什么特别的记忆浮现。",
+        "脑子里暂时一片空白。",
+        "一下子想不起相关的事。",
+    ]
+
+    _EMOTION_DIMENSIONS = [
+        "joy", "sadness", "anger", "fear", "surprise",
+        "disgust", "trust", "anticipation", "interest", "confusion",
+    ]
+
+    _DERIVE_TEMPLATES: dict[str, list[str]] = {
+        "joy": ["这些记忆让我觉得他最近状态不错。", "看来那段时间挺开心的。"],
+        "sadness": ["这些记忆透着一丝感伤。", "能感觉到他有些低落。"],
+        "anger": ["他似乎对某些事情耿耿于怀。"],
+        "anxiety": ["这些记忆让我觉得他最近压力不小。", "能感觉到他有些焦虑。"],
+        "surprise": ["有些出乎意料的事情发生在他身上。"],
+        "trust": ["他对身边的人似乎很信任。"],
+        "interest": ["他对新鲜事物保持着好奇。"],
+    }
+
+    def _summarize(self, cm: ChainedMemory) -> str:
+        """将一条记忆摘要为 ≤100 字的简短文本"""
+        e = cm.entry
+        val = e.value
+        if isinstance(val, dict):
+            # 取第一个有意义的字符串值
+            for v in val.values():
+                if isinstance(v, str) and v.strip():
+                    return v.strip()[:100]
+            # fallback: JSON 摘要
+            return json.dumps(val, ensure_ascii=False)[:100]
+        return str(val)[:100]
+
+    def _emotion_annotate(self, cm: ChainedMemory) -> str:
+        """为有 emotional_tags 的记忆生成情绪注解"""
+        e = cm.entry
+        if not e.emotional_tags:
+            return ""
+        tags = e.emotional_tags
+        # 找到最强的情绪维度
+        strongest_dim = ""
+        strongest_val = -1.0
+        for dim in self._EMOTION_DIMENSIONS:
+            val = tags.get(dim, 0)
+            if isinstance(val, (int, float)) and val > strongest_val:
+                strongest_val = float(val)
+                strongest_dim = dim
+        if strongest_dim and strongest_val > 0.3:
+            annotations = {
+                "joy": "当时聊这个的时候还挺开心的",
+                "sadness": "说起这个有点伤感",
+                "anger": "提到这事的时候能感觉到不满",
+                "fear": "他好像有些担忧",
+                "surprise": "当时挺意外的",
+                "trust": "他对这事挺信任的",
+                "anticipation": "他挺期待这个的",
+                "interest": "他对这个很感兴趣",
+                "confusion": "当时有点困惑",
+            }
+            text = annotations.get(strongest_dim, "")
+            if text:
+                return f"（{text}）"
+        return ""
+
+    def _derive_emotion_inference(self, entries: list[ChainedMemory]) -> str | None:
+        """检测多条记忆的情绪一致性，生成推演"""
+        emotions: list[str] = []
+        for cm in entries:
+            e = cm.entry
+            if e.emotional_tags:
+                for dim in self._EMOTION_DIMENSIONS:
+                    val = e.emotional_tags.get(dim, 0)
+                    if isinstance(val, (int, float)) and float(val) > 0.5:
+                        emotions.append(dim)
+
+        if len(emotions) < 2:
+            return None
+
+        # 找 dominant 维度
+        from collections import Counter
+        counts = Counter(emotions)
+        total = len(emotions)
+        dominant_dim, dominant_count = counts.most_common(1)[0]
+        if dominant_count / total > 0.6:
+            templates = self._DERIVE_TEMPLATES.get(dominant_dim)
+            if templates:
+                import random
+                return random.choice(templates)
+
+        return None
+
+    def _format_recall_result(self, entries: list[ChainedMemory]) -> str:
+        """将联锁记忆列表格式化为自然语言回溯文本"""
+        import random
+
+        if not entries:
+            return random.choice(self._NO_MEMORY_PHRASES)
+
+        lines: list[str] = []
+
+        # 第一条: "我记得" + 情绪注解
+        direct = entries[0]
+        summary = self._summarize(direct)
+        annot = self._emotion_annotate(direct)
+        line = f"我记得：{summary}。"
+        if annot:
+            line += annot
+        lines.append(line)
+
+        # 延伸记忆: 随机连接词 + 情绪注解
+        for cm in entries[1:]:
+            connector = random.choice(self._CONNECTORS)
+            summary = self._summarize(cm)
+            annot = self._emotion_annotate(cm)
+            line = f"{connector}：{summary}。"
+            if annot:
+                line += annot
+            lines.append(line)
+
+        # 情绪推演
+        inference = self._derive_emotion_inference(entries)
+        if inference:
+            lines.append(inference)
+
+        return "【记忆回溯】\n" + "\n".join(lines)
+
+    # ── Spec 003: search_chained() ────────────────────────────
+
+    async def search_chained(
+        self,
+        query: str,
+        chain_config: RecallChainConfig | None = None,
+    ) -> list[ChainedMemory]:
+        """联锁记忆检索主入口。
+        
+        流程: FTS5 主检索 → 4 级延伸链 → 全局去重 → 深刻化 boost → 异步分级迁移。
+        """
+        assert self._db
+        if chain_config is None:
+            from chat_core.core.types import LOGIC_BRAIN_CHAIN_CONFIG
+            chain_config = LOGIC_BRAIN_CHAIN_CONFIG
+
+        ns_prefix = chain_config.namespace_prefix
+        max_per_level = chain_config.max_per_level
+
+        # ① FTS5 主检索
+        directs = await self._search_fts5(query, ns_prefix, chain_config.top_n)
+        if not directs:
+            directs = await self._search_like(query, ns_prefix, chain_config.top_n)
+
+        # ② 对每个 rank 延伸链
+        all_chain: list[ChainedMemory] = []
+        for rank, entry in enumerate(directs):
+            ext_n = chain_config.extensions[rank] if rank < len(chain_config.extensions) else 0
+            # Direct match
+            all_chain.append(ChainedMemory(
+                entry=entry, chain_level=0,
+                chain_parent_key=None,
+                relevance_score=1.0 - rank * 0.1,
+            ))
+            if ext_n > 0:
+                extended = await self._extend_chain(entry, ext_n, ns_prefix, max_per_level)
+                all_chain.extend(extended)
+
+        # ③ 全局去重
+        final = self._dedup_by_quality(all_chain)
+
+        # ④ 深刻化: salience + access_count boost
+        await self._apply_salience_boost(final)
+
+        # ⑤ 异步触发记忆分级迁移
+        asyncio.create_task(self._migrate_short_to_long())
+        asyncio.create_task(self._trim_short_term())
+
+        return final
+
+    # ── Spec 003: 深刻化 + 记忆分级 ──────────────────────────
+
+    _SALIENCE_BOOST = {
+        0: 0.50,   # direct
+        1: 0.30,   # links
+        2: 0.20,   # topic_tags
+        3: 0.15,   # entity
+        4: 0.10,   # namespace
+    }
+
+    async def _apply_salience_boost(self, results: list[ChainedMemory]) -> None:
+        """对所有命中记忆执行 salience + access_count 递增"""
+        assert self._db
+        now = datetime.now().isoformat()
+        for cm in results:
+            boost = self._SALIENCE_BOOST.get(cm.chain_level, 0.10)
+            namespace = cm.entry.namespace
+            key = cm.entry.key
+            # 原子 UPDATE
+            await self._db.execute(
+                """UPDATE memories SET
+                   salience = MIN(salience + ?, 10.0),
+                   access_count = access_count + 1,
+                   last_access = ?
+                   WHERE namespace = ? AND key = ?""",
+                (boost, now, namespace, key),
+            )
+        await self._db.commit()
+
+    async def _migrate_short_to_long(self) -> None:
+        """短期记忆 → 长期记忆：salience ≥ 5 且 access_count ≥ 3 的迁移到 user/*"""
+        assert self._db
+        try:
+            cursor = await self._db.execute(
+                "SELECT * FROM memories WHERE namespace LIKE ? AND salience >= 5 AND access_count >= 3",
+                ("short_term/%",),
+            )
+            rows = await cursor.fetchall()
+            for row in rows:
+                entry = self._row_to_entry(row)
+                old_ns = entry.namespace
+                # 构造新 namespace: short_term/... → user/...
+                new_ns = old_ns.replace("short_term/", "user/", 1)
+                # 检查目标是否已存在
+                existing = await self.get(new_ns, entry.key)
+                if existing:
+                    # 已存在则合并 salience
+                    merged_salience = min(existing.salience + entry.salience * 0.5, 10.0)
+                    await self._db.execute(
+                        "UPDATE memories SET salience = ? WHERE namespace = ? AND key = ?",
+                        (merged_salience, new_ns, entry.key),
+                    )
+                else:
+                    entry.namespace = new_ns
+                    entry.salience = min(entry.salience + 0.5, 10.0)
+                    await self.save(entry)
+                # 删除旧条目
+                await self._db.execute(
+                    "DELETE FROM memories WHERE namespace = ? AND key = ?",
+                    (old_ns, entry.key),
+                )
+            if rows:
+                await self._db.commit()
+        except Exception:
+            pass  # 静默失败，不影响主流程
+
+    async def _mark_deep_memory(self) -> None:
+        """长期记忆 → 深刻记忆：salience ≥ 7 的标记 decay_curve='deep'"""
+        assert self._db
+        try:
+            await self._db.execute(
+                "UPDATE memories SET decay_curve = 'deep' "
+                "WHERE salience >= 7 AND decay_curve != 'deep' "
+                "AND namespace NOT LIKE 'short_term/%'"
+            )
+            await self._db.commit()
+        except Exception:
+            pass
+
+    async def _trim_short_term(self) -> None:
+        """short_term/* 裁剪至最多 10 条（按 salience 降序保留）"""
+        assert self._db
+        try:
+            cursor = await self._db.execute(
+                "SELECT namespace, key, salience FROM memories "
+                "WHERE namespace LIKE ? ORDER BY salience DESC",
+                ("short_term/%",),
+            )
+            rows = await cursor.fetchall()
+            if len(rows) > 10:
+                for row in rows[10:]:
+                    await self._db.execute(
+                        "DELETE FROM memories WHERE namespace = ? AND key = ?",
+                        (row["namespace"], row["key"]),
+                    )
+                await self._db.commit()
+        except Exception:
+            pass
+
     async def query(
         self,
         namespace_prefix: str,
@@ -452,4 +934,7 @@ class MemoryStore:
             updated_at=datetime.fromisoformat(row["updated_at"]) if row["updated_at"] else datetime.now(),
             expires_at=datetime.fromisoformat(row["expires_at"]) if row["expires_at"] else None,
             ttl=int(row["ttl"]) if row["ttl"] else None,
+            access_count=int(row["access_count"]) if row["access_count"] is not None else 0,
+            last_access=row["last_access"] if row["last_access"] else None,
+            decay_curve=row["decay_curve"] if row["decay_curve"] else "standard",
         )

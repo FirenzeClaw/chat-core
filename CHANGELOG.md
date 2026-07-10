@@ -1,5 +1,32 @@
 # Changelog
 
+## [Unreleased] — 2026-07-10 (记忆联锁 + Recall 深刻化)
+
+### Added
+
+- **记忆联锁检索** (`MemoryStore.search_chained()`): FTS5 主检索 → 4 级关联链延伸 (显式 links → topic_tags → entity_type → namespace)，每次 recall 自然联想关联记忆
+- **自然语言回溯** (`MemoryStore._format_recall_result()`): recall 返回自然语言文本（"【记忆回溯】\n我记得：..."），随机连接词、情绪注解、情绪推演，替换旧 JSON 格式
+- **Recall 深刻化**: 每次 recall 命中后 salience 递增 (direct +0.5, links +0.3, tags +0.2, entity +0.15, namespace +0.1)，access_count 自动 +1
+- **记忆分级**: 三级记忆 — 短期记忆 (short_term/*, 最多 10 条裁剪) → 长期记忆 (salience≥5 + access_count≥3, 自动迁移到 user/*) → 深刻记忆 (salience≥7, decay_curve='deep')
+- **主脑/子Session recall 权限隔离**: 主脑全量访问，子Session 仅可读 user/{uid}/* + short_term/*
+- **联锁配置**: `RecallChainConfig` 包含 top_n、extensions、max_per_level、namespace_prefix；`LOGIC_BRAIN_CHAIN_CONFIG` (5+3+2+2+1+0) 和 `SUB_SESSION_CHAIN_CONFIG` (3+2+1+0) 预置常量
+- **ChainedMemory 数据类型**: 含 entry、chain_level、chain_parent_key、relevance_score 元数据
+- **Schema 迁移**: access_count、last_access、decay_curve 列 (idempotent ALTER TABLE)
+
+### Changed
+
+- `LogicBrain._execute_recall()`: 切换到 `search_chained()` 联锁检索
+- `LogicBrain.think_inject()`: 使用 `_format_recall_result()` 自然语言回溯注入子 Session
+- `register_sub_session_tools()`: 新增 `chain_config: RecallChainConfig` 参数，recall 工具使用联锁检索
+- `BotAdapter._get_or_create_sub_session()`: 为每用户构造带 namespace_prefix 的 `RecallChainConfig`
+
+### Tests
+
+- 新增 16 测试 (Spec 003 WP2): 联锁检索/延伸链/去重/断链跳过/自然语言输出/深刻化/分级迁移/搜索/权限隔离
+- 全量回归: 124 tests passed
+
+---
+
 ## [Unreleased] — 2026-07-09 (QQ Bot 集成)
 
 ### Added

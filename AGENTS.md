@@ -111,7 +111,7 @@ QQ Bot 模式下：
 
 | 文件 | 职责 | 关键类 |
 |------|------|--------|
-| `memory.py` | SQLite FTS5 + jieba 分词记忆存储，含 spread activation + cluster boost | `MemoryStore`, `_segment_chinese()`, `_spread_activate()`, `_cluster_boost()` |
+| `memory.py` | SQLite FTS5 + jieba 分词记忆存储，含 spread activation + cluster boost + search_chained (联锁检索) + _format_recall_result (自然语言回溯) + 记忆分级 (短期/长期/深刻) | `MemoryStore`, `search_chained()`, `_segment_chinese()`, `_spread_activate()`, `_cluster_boost()`, `_migrate_short_to_long()` |
 | `emotion.py` | 10维×3脑情绪引擎 (衰减+传染) | `EmotionEngine` |
 | `personality.py` | 8维人格权重 → 行为参数映射 | `PersonalityEngine` |
 | `attention.py` | Focus/Dominance 注意力模型 | `AttentionModel` |
@@ -250,7 +250,7 @@ python -m pytest tests/ --cov=chat_core --cov-report=term
 
 | 测试文件 | 覆盖模块 |
 |----------|---------|
-| `tests/test_memory.py` | MemoryStore CRUD/FTS5/关联/TTL |
+| `tests/test_memory.py` | MemoryStore CRUD/FTS5/关联/TTL + Spec 003 联锁检索/深刻化/分级 |
 | `tests/test_loop.py` | ReActLoop 终止条件/压缩/工具处理 |
 | `tests/test_config.py` | Config 加载/校验/环境变量 |
 | `tests/test_brain.py` | Brain 创建/池并发/限速器 |

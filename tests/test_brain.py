@@ -238,3 +238,77 @@ class TestRateLimiter:
         await limiter.acquire()
         elapsed = time.monotonic() - start
         assert elapsed >= 0.25  # should respect cooldown
+
+
+# ── Spec 003: LogicBrain 联锁 recall 测试 (Phase 5, US3) ─────
+
+class TestLogicRecallChained:
+    """T035: LogicBrain._execute_recall 使用 search_chained() 联锁检索."""
+
+    @pytest.mark.asyncio
+    async def test_logic_recall_chained(self):
+        """T035: mock search_chained, 验证返回 list[MemoryEntry]."""
+        from chat_core.core.types import (
+            ChainedMemory,
+            LOGIC_BRAIN_CHAIN_CONFIG,
+            MemoryEntry,
+        )
+
+        # Create mocked recalls
+        mock_entry = MemoryEntry(
+            namespace="user/facts", key="test_key",
+            value={"content": "test value"},
+        )
+        chained_results = [
+            ChainedMemory(entry=mock_entry, chain_level=0, chain_parent_key=None, relevance_score=1.0),
+        ]
+
+        provider = make_provider()
+        memory = make_memory()
+        memory.search_chained = AsyncMock(return_value=chained_results)
+        pe = make_prompt_engine()
+
+        brain = LogicBrain(provider, memory, pe)
+
+        # Simulate a recall tool call
+        from chat_core.core.types import ToolCall
+        import json
+        tc = ToolCall(
+            id="call_1",
+            function_name="recall",
+            function_args=json.dumps({"query": "测试查询"}),
+        )
+
+        entries = await brain._execute_recall(tc)
+
+        # Verify search_chained was called with correct config
+        memory.search_chained.assert_called_once_with("测试查询", LOGIC_BRAIN_CHAIN_CONFIG)
+
+        # Verify returns list[MemoryEntry]
+        assert isinstance(entries, list)
+        assert len(entries) == 1
+        assert entries[0].key == "test_key"
+
+        # Verify _last_chained_recall was stored
+        assert len(brain._last_chained_recall) == 1
+
+    @pytest.mark.asyncio
+    async def test_logic_recall_chained_error_handling(self):
+        """T035: search_chained 异常时返回空列表并清空缓存."""
+        provider = make_provider()
+        memory = make_memory()
+        memory.search_chained = AsyncMock(side_effect=RuntimeError("DB error"))
+        pe = make_prompt_engine()
+
+        brain = LogicBrain(provider, memory, pe)
+        from chat_core.core.types import ToolCall
+        import json
+        tc = ToolCall(
+            id="call_1",
+            function_name="recall",
+            function_args=json.dumps({"query": "anything"}),
+        )
+
+        entries = await brain._execute_recall(tc)
+        assert entries == []
+        assert brain._last_chained_recall == []

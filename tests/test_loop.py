@@ -24,6 +24,7 @@ from chat_core.core.types import (
     ToolCall,
     Usage,
 )
+from chat_core.systems.memory import MemoryStore
 
 
 # ── Helpers ──────────────────────────────────────────────────
@@ -253,3 +254,127 @@ class TestReActLoopTools:
         # 第二次纯文本：已重试过，_done=True
         await loop._act(result)
         assert loop._done is True
+
+
+# ── Spec 003: 子Session recall 隔离测试 (Phase 5, US3) ────────
+
+class TestSubRecallIsolation:
+    """T036-T037: 子Session recall 命名空间隔离 + 自然语言输出."""
+
+    @pytest.mark.asyncio
+    async def test_sub_recall_namespace_isolation(self):
+        """T036: namespace_prefix="user/test_user" 过滤其他用户记忆."""
+        from chat_core.core.types import (
+            ChainedMemory,
+            MemoryEntry,
+            RecallChainConfig,
+            SUB_SESSION_CHAIN_CONFIG,
+        )
+        import json
+
+        # Use a real MemoryStore so _format_recall_result works properly
+        real_store = MemoryStore(":memory:")
+        await real_store.open()
+        try:
+            real_store.search_chained = AsyncMock(return_value=[
+                ChainedMemory(
+                    entry=MemoryEntry(
+                        namespace="user/test_user/facts", key="k1",
+                        value={"content": "test user memory"},
+                    ),
+                    chain_level=0, chain_parent_key=None, relevance_score=1.0,
+                ),
+            ])
+
+            chain_config = RecallChainConfig(
+                top_n=3, extensions=[2, 1, 0], max_per_level=2,
+                namespace_prefix="user/test_user",
+            )
+
+            # Call _handle_recall with chained config
+            result = await _handle_recall(
+                {"query": "test"},
+                memory_store=real_store,
+                chain_config=chain_config,
+            )
+
+            # Verify search_chained was called with correct config
+            real_store.search_chained.assert_called_once()
+            call_args = real_store.search_chained.call_args
+            assert call_args[0][0] == "test"
+            # chain_config is passed as second positional argument
+            assert call_args[0][1].namespace_prefix == "user/test_user"
+
+            # Result should be a natural language string (not JSON array)
+            assert isinstance(result, str)
+            assert len(result) > 0
+            # Should start with "【记忆回溯】" (or be a no-memory phrase)
+            assert "【记忆回溯】" in result or any(
+                phrase in result for phrase in [
+                    "目前没什么特别的记忆浮现",
+                    "脑子里暂时一片空白",
+                    "一下子想不起相关的事",
+                ]
+            )
+        finally:
+            await real_store.close()
+
+    @pytest.mark.asyncio
+    async def test_sub_recall_natural_language(self):
+        """T037: mock search_chained 返回自然语言文本, 验证非 JSON."""
+        from chat_core.core.types import ChainedMemory, MemoryEntry, RecallChainConfig
+        import json
+
+        # Use a real MemoryStore so _format_recall_result works properly
+        real_store = MemoryStore(":memory:")
+        await real_store.open()
+        try:
+            # Mock search_chained to return controlled results
+            real_store.search_chained = AsyncMock(return_value=[
+                ChainedMemory(
+                    entry=MemoryEntry(
+                        namespace="user/alice/facts", key="mem1",
+                        value={"content": "Alice 是设计师"},
+                    ),
+                    chain_level=0, chain_parent_key=None, relevance_score=1.0,
+                ),
+                ChainedMemory(
+                    entry=MemoryEntry(
+                        namespace="user/alice/facts", key="mem2",
+                        value={"content": "Alice 喜欢画画"},
+                    ),
+                    chain_level=1, chain_parent_key="user/alice/facts/mem1",
+                    relevance_score=0.8,
+                ),
+            ])
+
+            chain_config = RecallChainConfig(
+                top_n=3, extensions=[2, 1, 0], max_per_level=2,
+                namespace_prefix="user/alice",
+            )
+
+            result = await _handle_recall(
+                {"query": "Alice"},
+                memory_store=real_store,
+                chain_config=chain_config,
+            )
+
+            # Result should be natural language, not JSON
+            assert isinstance(result, str)
+            assert not result.startswith("[")
+            assert not result.startswith("{")
+            assert "我记得" in result
+
+            # Without chain_config → old JSON format
+            store_no_chain = MagicMock()
+            store_no_chain.search = AsyncMock(return_value=[])
+            result2 = await _handle_recall(
+                {"query": "test"},
+                memory_store=store_no_chain,
+                chain_config=None,
+            )
+            data = json.loads(result2)
+            assert "results" in data
+            assert "count" in data
+        finally:
+            await real_store.close()
