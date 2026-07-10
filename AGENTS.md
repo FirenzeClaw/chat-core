@@ -111,15 +111,19 @@ QQ Bot 模式下：
 
 | 文件 | 职责 | 关键类 |
 |------|------|--------|
-| `memory.py` | SQLite FTS5 + jieba 分词记忆存储，含 spread activation + cluster boost + search_chained (联锁检索) + _format_recall_result (自然语言回溯) + 记忆分级 (短期/长期/深刻) | `MemoryStore`, `search_chained()`, `_segment_chinese()`, `_spread_activate()`, `_cluster_boost()`, `_migrate_short_to_long()` |
+| `memory.py` | SQLite FTS5 + jieba 分词记忆存储，含 spread activation + cluster boost + search_chained (联锁检索) + _format_recall_result (自然语言回溯) + 记忆分级 (短期/长期/深刻) + 幂律遗忘 (effective_salience) + 双向迁移 | `MemoryStore`, `search_chained()`, `effective_salience()`, `_migrate_short_to_long()`, `_downgrade_long_to_short()` |
 | `emotion.py` | 10维×3脑情绪引擎 (衰减+传染) | `EmotionEngine` |
 | `personality.py` | 8维人格权重 → 行为参数映射 | `PersonalityEngine` |
-| `attention.py` | Focus/Dominance 注意力模型 | `AttentionModel` |
-| `boredom.py` | 无聊检测器 (指数衰减) | `BoredomDetector` |
+| `attention.py` | 三态注意力状态机 (FOCUSED/DRIFTING/DULL) + apply_event() 13事件转移 + 平滑过渡 + 疲劳因子 | `AttentionModel`, `AttentionStateEnum`, `AttentionEvent` |
+| `boredom.py` | 无聊检测器 (指数衰减 + 注意力状态感知 tick 间隔) | `BoredomDetector` |
 | `interest.py` | 话题追踪 + FuzzyParam + 沉默累积器 | `InterestModel`, `FuzzyParam`, `SilenceAccumulator` |
 | `review.py` | 三层错误检测 + 意图提取 | `ReviewSystem`, `extract_intent()` |
 | `proactive.py` | 主动行为系统 (initiative/intent/deferred) | `ProactiveSystem`, `_enhance_recall()`, `_recall_with_memory()` |
 | `multimodal.py` | 图片检测 + 降级链 | `MultimodalHandler` |
+| `defense.py` | 心理防御机制 (DENIAL/RATIONALIZE/PROJECT) | `DefenseEngine` |
+| `energy.py` | 精力管理 (消耗+恢复+防御联动) | `EnergyBar` |
+| `subjective_time.py` | 主观时间感知 (注意力/情绪/兴趣三维调制) | `SubjectiveClock` |
+| `metacognition.py` | 元认知深度 (Spec 006): 定期+异常双触发审视、上下文组装、双输出 (insight_text + param_overrides) | `MetacognitionEngine` |
 
 ---
 
@@ -155,6 +159,10 @@ TurnManager.process_turn(user_message)
   │      combined ≤ 0.5 → SILENCE (沉默归档 + 累积器)
   │
   └─ 6. ARCHIVING: 写入 user/default/conversations + self/inner_thoughts
+  │
+  └─ 7. METACOGNITION: MetacognitionEngine.check_triggers() 5种触发
+       → LogicBrain.metacognition_pass() → insight_text 写入 memory
+       → MetaParamOverrides 注入各子系统 (review/defense/emotion/interest/loop)
 ```
 
 ### 记忆检索管线
@@ -229,13 +237,18 @@ LLM 返回 NonStreamResult {content, tool_calls}
 | 审查阈值 | combined > 0.5 | hardcoded in turn_manager.py |
 | 无聊触发 | B(t) < 0.30 | config.yaml systems.boredom.trigger_threshold |
 | 情绪维度 | 10 (含半衰期) | config.yaml systems.emotion.decay |
+| 注意力衰减 | 三态分级: 0.001/s (FOCUSED), 0.002/s (DRIFTING), 0.0005/s (DULL) | config.yaml systems.attention.drift |
+| 注意力疲劳 | 50 turns 满疲劳, 衰减加速 1.5× | config.yaml systems.attention.fatigue |
+| 元认知周期 | 每 5 轮定期审视 | config.yaml systems.metacognition.periodic_interval |
+| 元认知信心阈值 | 0.6 (低于此只写文本不调参) | config.yaml systems.metacognition.confidence_threshold |
+| 参数覆盖过期 | 5 轮后自动恢复 | config.yaml systems.metacognition.override_expiry_turns |
 
 ---
 
 ## 测试
 
 ```bash
-# 单元测试 (95 tests)
+# 单元测试 (261 tests)
 python -m pytest tests/ -v
 
 # Spec E2E 测试 (19 scenarios)
@@ -250,13 +263,19 @@ python -m pytest tests/ --cov=chat_core --cov-report=term
 
 | 测试文件 | 覆盖模块 |
 |----------|---------|
-| `tests/test_memory.py` | MemoryStore CRUD/FTS5/关联/TTL + Spec 003 联锁检索/深刻化/分级 |
+| `tests/test_memory.py` | MemoryStore CRUD/FTS5/关联/TTL + Spec 003 联锁检索/深刻化/分级/幂律衰减/双向迁移 |
 | `tests/test_loop.py` | ReActLoop 终止条件/压缩/工具处理 |
 | `tests/test_config.py` | Config 加载/校验/环境变量 |
 | `tests/test_brain.py` | Brain 创建/池并发/限速器 |
-| `tests/test_phase6_emotion.py` | EmotionEngine/PersonalityEngine/AttentionModel |
+| `tests/test_phase6_emotion.py` | EmotionEngine/PersonalityEngine/AttentionModel + 注意力状态机 (11 tests) |
 | `tests/test_qq_protocol.py` | MessageContext/事件解析/去重 |
 | `tests/test_qq_sessions.py` | UserSession/SessionManager TTL |
+| `tests/test_design_alignment.py` | 审查异步/subconscious注入/递归深度/权重/拧巴/降级/情绪通道 |
+| `tests/test_compound_emotion.py` | 复合情绪: INTERACTION_MATRIX + 衰减 + 传染 + alert + 脆弱检测 (28 tests) |
+| `tests/test_defense.py` | 防御引擎: DENIAL/RATIONALIZE/PROJECT + 脆弱联动 (7 tests) |
+| `tests/test_energy.py` | EnergyBar: consume/recover/exit/防御联动 (9 tests) |
+| `tests/test_subjective_time.py` | SubjectiveClock: speed_factor/boredom联动/记忆标记 (6 tests) |
+| `tests/test_metacognition.py` | MetacognitionEngine: 触发判定/上下文组装/参数覆盖/confidence门控/过期 (29 tests) |
 | `tests/spec_e2e_test.py` | 全量 Spec 19 场景 (需要 API key) |
 
 ---
@@ -307,7 +326,29 @@ python -m pytest tests/ --cov=chat_core --cov-report=term
 | 技术决策 | `specs/002-qq-bot-integration/research.md` |
 | QQ Bot 行为契约 | `specs/002-qq-bot-integration/contracts/qq-bot-contract.md` |
 
+**003-memory-chain-recall**:
 | 文档 | 路径 |
 |------|------|
-| 原始架构设计 | `chat-core-design.md` |
+| 功能规格 (24 FR) | `specs/003-memory-chain-recall/spec.md` |
+| 实施计划 (6 WP) | `specs/003-memory-chain-recall/plan.md` |
+| 任务列表 (42 tasks) | `specs/003-memory-chain-recall/tasks.md` |
+| 数据模型 | `specs/003-memory-chain-recall/data-model.md` |
+| 技术决策 | `specs/003-memory-chain-recall/research.md` |
+
+**004-design-alignment**:
+| 文档 | 路径 |
+|------|------|
+| 功能规格 (10 FR) | `specs/004-design-alignment/spec.md` |
+| 实施计划 (4 Phase) | `specs/004-design-alignment/plan.md` |
+| 任务列表 (17 tasks) | `specs/004-design-alignment/tasks.md` |
+
+| 文档 | 路径 |
+|------|------|
+| 原始架构设计 (v2) | `chat-core-design.md` |
+| 注意力状态机设计 | `docs/superpowers/specs/2026-07-10-attention-state-machine-design.md` |
+| 注意力状态机实施计划 | `docs/superpowers/plans/2026-07-10-attention-state-machine.md` |
+| 记忆联锁设计 | `docs/superpowers/specs/2026-07-10-memory-chain-recall-design.md` |
+| 幂律遗忘实施计划 | `docs/superpowers/plans/2026-07-10-memory-power-law-decay.md` |
+| 复合情绪实施计划 | `docs/superpowers/plans/2026-07-10-compound-emotion-defense.md` |
+| 具身感知实施计划 | `docs/superpowers/plans/2026-07-10-embodied-perception.md` |
 | Agent 状态机模式分析 | `chat-cli-research.md` §Agent 状态机核心模式 |

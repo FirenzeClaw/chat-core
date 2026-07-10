@@ -1,5 +1,54 @@
 # Changelog
 
+## [Unreleased] — 2026-07-10 (Phase 1+2: 注意力 + 幂律 + 复合情绪 + 具身感知)
+
+### Added
+
+- **注意力状态机完整实施** (Phase 1): 三态模型 (FOCUSED/DRIFTING/DULL) + `apply_event()` 13事件转移矩阵 + 0.3s 平滑过渡 + 状态感知分级衰减 (0.001/0.002/0.0005/s) + 疲劳因子 (50 turns 满疲劳, 1.5× 加速) + DULL 态不沉默
+- **注意力系统集成**: `emotion.py` Δvalence 检测→`emotion_alert` 事件发布；`loop.py` focus 状态注入 system prompt + recall→注意力回调 (salience≥7→MEMORY_STRONG_HIT)；`turn_manager.py` 延迟启动事件监听器 (`emotion_alert`+`logic_conflict`) + 发言段数惩罚；`adapter.py` RaceTracker 竞态阈值检测 (2→3 RACE_MILD, 4→5 RACE_SEVERE)
+- **§5 昏沉联动**: `boredom.py` 状态感知 tick 间隔 (30/20/15s) + DULL 触发阈值 0.40；`interest.py` DULL 态情绪调制兴趣触发 (×0.5~×2.0)；`proactive.py` `_should_initiate()` DULL→禁发, DRIFTING→×0.3
+- **配置全外化**: `config.yaml` `systems.attention` 段扩展为 `state_machine` + `drift` + `fatigue` + `boredom_link`，所有参数可调
+- **14 新增测试**: `TestAttentionStateMachine` (8), `TestEmotionAttentionLink` (3), `TestAttentionInjection` (3)
+- **实施计划文档** (`docs/superpowers/plans/2026-07-10-attention-state-machine.md`): 4 阶段 10 任务详细计划
+- **Spec 003 §12 幂律遗忘曲线**: `effective_salience()` 幂律公式 `S/(1+β×t^α)` (standard β=0.01, deep β=0.001)，`_apply_salience_boost()` 先衰减后 boost，`_downgrade_long_to_short()` 降级迁移 (salience<3)，`_unmark_deep_memory()` deep 回退 (salience<5)，`created_at_epoch` REAL 列，`decay.enabled` 配置开关
+- **7 新增测试**: `TestPowerLawDecay` (4) + `TestBidirectionalMigration` (3)，全量 175 tests
+- **幂律遗忘实施计划** (`docs/superpowers/plans/2026-07-10-memory-power-law-decay.md`): 7 任务详细计划
+- **Spec 005 复合情绪+防御+脆弱感** (Phase 2): 12 维复合情绪 (INTERACTION_MATRIX 10键19条目 + tick() 七步流) + DefenseEngine 三种防御 (DENIAL/RATIONALIZE/PROJECT) + 脆弱感系统 (极端情绪检测 + self_disclosure ×2.0 + 防御 ×0.3) + 42 新增测试
+- **Spec 007 具身感知** (Phase 2): EnergyBar 精力管理 (事件消耗 + idle 恢复 + 防御联动) + SubjectiveClock 主观时钟 (注意力/情绪/兴趣三维调制) + 记忆时间注解 + 15 新增测试
+- **Spec 006 元认知深度** (Phase 2): MetacognitionEngine 定期+异常双触发审视 (5种触发)、LogicBrain.metacognition_pass() 单次 LLM 调用 + metacognition_report 工具、MetaParamOverrides 参数覆盖容器 (审查阈值/防御概率/情绪阈值/兴趣/内心戏)、5 子系统消费集成、29 新增测试
+- **复合情绪实施计划** (`docs/superpowers/plans/2026-07-10-compound-emotion-defense.md`): 11 任务、4 阶段
+- **具身感知实施计划** (`docs/superpowers/plans/2026-07-10-embodied-perception.md`): 9 任务、4 阶段
+- **审查异步化** (specs/004-design-alignment): CLI 审查从同步 `await` 改为 `asyncio.create_task` 异步执行，子Session `send_reply` 立即输出不等待审查。QQ Bot 新增完整审查纠正管线 (`_async_review_and_decide`)
+- **纠正延迟生效**: `_issue_correction()` 不再立即运行纠正子Session，改为写入 `subconscious/corrections`，下一轮子Session `_init_messages` 自动读取并注入
+- **子Session 读潜意识区**: `ReActLoop._inject_subconscious_corrections()` 在 `_init_messages` 后查询 `subconscious/corrections` 并注入 system message
+- **纠正子Session 恢复完整能力**: max_iter 2→5，重新开启 inner_thoughts/wait 工具，递归深度计数器 `_correction_depth ≤ 2`
+- **双脑权重平等**: `combined = logic × 0.5 + emotion × 0.5`（原 0.6/0.4）
+- **双脑持续情绪通知通道**: `emotion_alert` 事件通道，情感主脑检测情绪变化实时通知逻辑主脑
+- **注意力状态机设计文档** (`docs/superpowers/specs/2026-07-10-attention-state-machine-design.md`): 三态模型 (FOCUSED/DRIFTING/DULL) + 平滑过渡 + 多脑协调 + 情绪/记忆/竞态/兴趣联动
+- **send_reply 工具返回格式优化**: `【QQ消息发送成功】<潜意识>{提示}` 格式，避免 LLM 误解为对话对象发言
+- **specs/004-design-alignment**: spec.md (10 FR), plan.md (4 Phase), tasks.md (17 tasks)
+
+### Fixed
+
+- **注意力衰减过快**: `drift_decay_rate 0.01→0.001`，解决跨 turn 100s 后 focus 归零导致 `should_exit_sub` 阻断子Session
+- **`_replies` 不重置**: `ReActLoop.run()` 新增 `self._replies.clear()`，修复跨 turn segment 计数虚高
+- **send_reply 停顿移除**: 删除 `asyncio.sleep(1-3s)` 内嵌停顿，分段回复更连贯
+- **400 错误修复**: `NonStreamResult` + `provider.chat()` + `brain.py` 补全 `reasoning_content` 回传链路
+- **自我介绍 prompt 增强**: `rules.yaml` 新增身份询问触发规则，`tools.yaml` 新增分段引导
+- **QQ Bot session/去重/token 修复**: 过期 session 清理旧 ReActLoop, deque 替代 set 去重, token 失败短过期重试
+
+### Changed
+
+- `chat-core-design.md`: 审查异步非阻塞、纠正延迟生效、多副脑、双脑权重平等、持续情绪通道
+- `config.yaml`: `drift_decay_rate: 0.001`
+
+### Tests
+
+- `tests/test_design_alignment.py` 新建: 25 tests 覆盖审查异步/subconscious注入/递归深度/权重/拧巴记录/异常降级/情绪通道
+- 全量回归: 154 tests passed
+
+---
+
 ## [Unreleased] — 2026-07-10 (记忆联锁 + Recall 深刻化)
 
 ### Added
