@@ -11,11 +11,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Any
 
 from chat_core.config import get_config
-from chat_core.core.brain import EmotionBrain, LogicBrain
+from chat_core.core.brain import ActionBrainPool, EmotionBrain, LogicBrain
 from chat_core.core.loop import ReActLoop, SubSessionConfig, register_sub_session_tools
 from chat_core.core.provider import ModelProvider
 from chat_core.core.prompt_engine import PromptEngine
@@ -25,7 +26,11 @@ from chat_core.systems.memory import MemoryStore
 from chat_core.systems.emotion import EmotionEngine
 from chat_core.systems.personality import PersonalityEngine
 from chat_core.systems.attention import AttentionModel
-from chat_core.qq.protocol import MessageContext, fetch_user_nickname
+from chat_core.systems.interest import InterestModel
+from chat_core.systems.review import ReviewSystem
+from chat_core.systems.boredom import BoredomDetector
+from chat_core.systems.proactive import ProactiveSystem
+from chat_core.qq.protocol import MessageContext, fetch_user_nickname, send_message
 from chat_core.qq.sessions import SessionManager, UserSession
 from chat_core.qq.race_tracker import RaceTracker
 from chat_core.qq.subconscious import SubconsciousInjector
@@ -47,6 +52,9 @@ class BotAdapter:
         emotion_brain: EmotionBrain | None = None,
         race_tracker: RaceTracker | None = None,
         subconscious_injector: SubconsciousInjector | None = None,
+        attention_model: AttentionModel | None = None,
+        qq_appid: str = "",
+        qq_secret: str = "",
     ):
         self._provider = provider
         self._memory = memory_store
@@ -57,6 +65,7 @@ class BotAdapter:
         self._emotion_brain = emotion_brain
         self._race_tracker = race_tracker or RaceTracker()
         self._subconscious = subconscious_injector or SubconsciousInjector()
+        self._attention_model = attention_model or AttentionModel()
 
         self._sub_sessions: dict[str, ReActLoop] = {}
         self._sessions = SessionManager()
@@ -67,6 +76,56 @@ class BotAdapter:
         self._c2c_reply_enabled: bool = qq_cfg.get("c2c_reply_enabled", True)
         self._group_reply_enabled: bool = qq_cfg.get("group_reply_enabled", True)
         self._passive_observe_enabled: bool = qq_cfg.get("passive_observe", True)
+
+        # ── ProactiveSystem (FR-19, FR-20) ─────────────────
+        self._qq_appid = qq_appid
+        self._qq_secret = qq_secret
+
+        # ActionBrainPool
+        self._action_pool = ActionBrainPool(
+            max_concurrent=get_config().brain_max_concurrent("action"),
+        )
+        self._action_pool.configure(provider, memory_store, prompt_engine)
+
+        # InterestModel (话题追踪)
+        ic = get_config().interest_config()
+        self._interest_model = InterestModel(
+            topic_trigger_threshold=int(ic.get("topic_trigger_threshold", 3)),
+            topic_weight_increment=float(ic.get("topic_weight_increment", 0.1)),
+            decay_per_hour=float(ic.get("decay_per_hour", 0.05)),
+        )
+
+        # ReviewSystem
+        self._review_system = ReviewSystem(provider, memory_store)
+
+        # BoredomDetector
+        self._boredom_detector = BoredomDetector()
+
+        # ProactiveSystem (FR-19)
+        self._proactive = ProactiveSystem(
+            provider=provider,
+            memory=memory_store,
+            prompt_engine=prompt_engine,
+            action_pool=self._action_pool,
+            interest_model=self._interest_model,
+            review_system=self._review_system,
+            emotion_engine=emotion_engine,
+            personality_engine=personality_engine,
+            attention_model=self._attention_model,
+            reply_callback=self._send_proactive_message,
+        )
+
+        self._boredom_detector.set_on_trigger(self._proactive._on_boredom_trigger)
+        self._boredom_detector.set_on_end_conversation(self._proactive._on_end_conversation_signal)
+
+        # 主动发言频控状态 (FR-20)
+        self._last_active_ctx: MessageContext | None = None
+        self._last_proactive_send: float = 0.0
+        self._proactive_min_interval: float = float(
+            qq_cfg.get("proactive_min_interval", 60.0)
+        )
+        self._proactive_backoff: float = 1.0
+        self._proactive_consecutive_failures: int = 0
 
     # ── 公共接口 ────────────────────────────────────────────
 
@@ -102,6 +161,13 @@ class BotAdapter:
 
         if user_session.turn_counter == 0:
             await self._ensure_profile(ctx)
+
+        # 追踪最近活跃用户（用于主动发言定向）
+        self._last_active_ctx = ctx
+
+        # 新对话开始 → 停止无聊检测，检查延迟意图 (FR-19)
+        self._on_conversation_started()
+        await self._proactive._check_deferred_actions()
 
         # 复用或创建子 Session
         loop = self._get_or_create_sub_session(ctx.session_key, ctx.user_id, ctx.scene)
@@ -149,6 +215,13 @@ class BotAdapter:
 
         # 异步提取用户事实（不阻塞 turn 完成）
         asyncio.create_task(self._extract_facts(ctx, "\n".join(segs)))
+
+        # 话题追踪: 从内心戏提取话题 (FR-19)
+        if loop.inner_thoughts:
+            self._proactive._record_topics_from_thoughts(loop.inner_thoughts)
+
+        # 对话结束 → 启动无聊检测 (FR-19)
+        self._on_conversation_ended()
 
         logger.info(
             "Turn 完成: user=%s turn=%d segments=%d",
@@ -344,7 +417,118 @@ class BotAdapter:
         except Exception:
             pass
 
-    # ── TTL 清理 ────────────────────────────────────────────
+    # ── 主动发言 (FR-19, FR-20, FR-10) ──────────────────────
+
+    async def _send_proactive_message(self, text: str) -> None:
+        """ProactiveSystem 的 reply_callback：将主动发言发送给 QQ 用户。
+
+        FR-20: 遵守 QQ 频控
+        FR-10: 竞态 >= medium 时降级（延迟而非丢弃）
+        """
+        # T041: 竞态降级 — race_severity >= medium 时延迟
+        severity = self._race_tracker.severity
+        if severity != "low":
+            logger.info(
+                "主动发言因竞态降级 (severity=%s)，延迟发送",
+                severity,
+            )
+            # 写入 nudge 以在竞态缓解后重试
+            try:
+                await self._memory.save(MemoryEntry(
+                    namespace="subconscious/nudges",
+                    key=f"deferred_proactive_{int(time.time())}",
+                    value={
+                        "source": "proactive_deferred",
+                        "content": text[:500],
+                        "severity": severity,
+                        "direction": "竞态缓解后发送",
+                    },
+                ))
+            except Exception:
+                pass
+            return
+
+        # T040: QQ 频控检查
+        now = time.time()
+        elapsed = now - self._last_proactive_send
+        if elapsed < self._proactive_min_interval:
+            wait_time = self._proactive_min_interval - elapsed
+            logger.debug("主动发言频控等待 %.1fs", wait_time)
+            await asyncio.sleep(wait_time)
+
+        # 发送给最近活跃的用户
+        if self._last_active_ctx is None:
+            logger.debug("无活跃用户，跳过主动发言")
+            return
+
+        ctx = self._last_active_ctx
+        try:
+            success = await send_message(
+                ctx, text,
+                appid=self._qq_appid,
+                secret=self._qq_secret,
+            )
+            if success:
+                self._proactive_consecutive_failures = 0
+                self._proactive_backoff = 1.0
+            else:
+                self._proactive_consecutive_failures += 1
+                self._proactive_backoff = min(
+                    300.0,
+                    self._proactive_backoff * 2.0,
+                )
+        except Exception:
+            logger.exception("主动发言发送失败: user=%s", ctx.user_id[:12])
+            self._proactive_consecutive_failures += 1
+
+        self._last_proactive_send = time.time()
+        logger.info("主动发言已发送: user=%s", ctx.user_id[:12])
+
+        # 连续失败时延长间隔
+        if self._proactive_consecutive_failures >= 3:
+            self._proactive_min_interval = min(
+                600.0,
+                self._proactive_min_interval * 1.5,
+            )
+            logger.warning(
+                "主动发言连续失败 %d 次，间隔延长至 %.0fs",
+                self._proactive_consecutive_failures,
+                self._proactive_min_interval,
+            )
+
+    def _on_conversation_ended(self) -> None:
+        """对话 turn 结束后启动无聊检测。
+
+        使用当前情绪和人格参数初始化 BoredomDetector。
+        """
+        if self._boredom_detector.is_active:
+            return
+
+        # 评估对话质量
+        eval_param = 0.5  # 默认值
+        if self._emotion_engine:
+            sub_state = self._emotion_engine.get_state("sub")
+            eval_param = (sub_state.joy + sub_state.trust) / 2
+
+        # 兴趣权重
+        interest_weight = 0.0
+        top_interests = self._interest_model.get_top_interests(3)
+        if top_interests:
+            interest_weight = top_interests[0][1]
+
+        # 冲动性
+        impulsiveness = (
+            self._personality_engine.weights.impulsiveness
+            if self._personality_engine else 0.2
+        )
+
+        self._boredom_detector.start(eval_param, interest_weight, impulsiveness)
+        logger.debug("无聊检测已启动: eval=%.2f interest=%.2f impulsiveness=%.2f",
+                     eval_param, interest_weight, impulsiveness)
+
+    def _on_conversation_started(self) -> None:
+        """新对话开始 — 停止无聊检测，检查延迟意图。"""
+        self._boredom_detector.stop()
 
     def cleanup_expired(self) -> int:
         cleaned = self._sessions.cleanup_expired()

@@ -728,3 +728,199 @@ class TestSalienceAndTiering:
                 f"Expected 'deep', got {updated.decay_curve}"
         finally:
             await store.close()
+
+
+# ── 衰减系统: 艾宾浩斯遗忘曲线测试 ─────────────────────────
+
+class TestDecay:
+    """apply_decay() 衰减测试."""
+
+    @pytest.mark.asyncio
+    async def test_decay_gist_low_salience(self):
+        """salience ≤ 5, >90 天 → expires_at 被设置."""
+        from datetime import timedelta
+
+        store = MemoryStore(":memory:")
+        await store.open()
+        try:
+            # 创建 100 天前的 gist 记忆 (salience=3)
+            old_date = datetime.now() - timedelta(days=100)
+            entry = MemoryEntry(
+                namespace="user/facts", key="old_gist",
+                value={"content": "很旧的记忆"},
+                layer="gist", salience=3.0,
+                decay_curve="standard",
+                created_at=old_date,
+            )
+            await store.save(entry)
+
+            # 执行衰减
+            result = await store.apply_decay()
+
+            # 应该被标记过期
+            updated = await store.get("user/facts", "old_gist")
+            assert updated is not None
+            assert updated.expires_at is not None, "expires_at should be set"
+            assert result["expired_count"] >= 1
+        finally:
+            await store.close()
+
+    @pytest.mark.asyncio
+    async def test_decay_gist_high_salience(self):
+        """salience > 7, >180 天 → expires_at 被设置; 中间 salience 不受影响."""
+        from datetime import timedelta
+
+        store = MemoryStore(":memory:")
+        await store.open()
+        try:
+            # 创建 190 天前的 gist 记忆 (salience=8)
+            old_date = datetime.now() - timedelta(days=190)
+            entry = MemoryEntry(
+                namespace="user/facts", key="high_sal_gist",
+                value={"content": "高 salience 旧记忆"},
+                layer="gist", salience=8.0,
+                decay_curve="standard",
+                created_at=old_date,
+            )
+            await store.save(entry)
+
+            # 创建 100 天前 salience=8 的记忆 — 不应过期 (未到 180 天)
+            mid_date = datetime.now() - timedelta(days=100)
+            mid_entry = MemoryEntry(
+                namespace="user/facts", key="mid_sal_gist",
+                value={"content": "中龄高 salience 记忆"},
+                layer="gist", salience=8.0,
+                decay_curve="standard",
+                created_at=mid_date,
+            )
+            await store.save(mid_entry)
+
+            result = await store.apply_decay()
+
+            # 190 天前的应该过期
+            updated = await store.get("user/facts", "high_sal_gist")
+            assert updated is not None
+            assert updated.expires_at is not None, "190-day entry should be expired"
+
+            # 100 天前的 salience=8 不应该过期 (窗口 180 天)
+            mid_updated = await store.get("user/facts", "mid_sal_gist")
+            assert mid_updated is not None
+            assert mid_updated.expires_at is None, "100-day entry should NOT be expired"
+
+            assert result["expired_count"] >= 1
+        finally:
+            await store.close()
+
+    @pytest.mark.asyncio
+    async def test_decay_deep_curve(self):
+        """decay_curve='deep' → 永不过期."""
+        from datetime import timedelta
+
+        store = MemoryStore(":memory:")
+        await store.open()
+        try:
+            # 创建 200 天前的 deep 记忆
+            old_date = datetime.now() - timedelta(days=200)
+            entry = MemoryEntry(
+                namespace="user/facts", key="deep_mem",
+                value={"content": "深刻记忆"},
+                layer="gist", salience=3.0,
+                decay_curve="deep",
+                created_at=old_date,
+            )
+            await store.save(entry)
+
+            result = await store.apply_decay()
+
+            # 不应该过期
+            updated = await store.get("user/facts", "deep_mem")
+            assert updated is not None
+            assert updated.expires_at is None, "deep curve entries should never expire"
+            assert result["expired_count"] == 0
+        finally:
+            await store.close()
+
+    @pytest.mark.asyncio
+    async def test_decay_access_boost(self):
+        """7 天内 access_count ≥ 3 → decay_start 延长 15 天."""
+        from datetime import timedelta
+
+        store = MemoryStore(":memory:")
+        await store.open()
+        try:
+            now = datetime.now()
+            # 创建条目，手动设置 access_count=3, last_access=1天前
+            entry = MemoryEntry(
+                namespace="user/facts", key="boost_me",
+                value={"content": "高频访问记忆"},
+                layer="gist", salience=5.0,
+                decay_curve="standard",
+                access_count=3,
+                last_access=(now - timedelta(days=1)).isoformat(),
+                created_at=now - timedelta(days=50),
+            )
+            await store.save(entry)
+
+            result = await store.apply_decay()
+
+            # 应该被 boost
+            updated = await store.get("user/facts", "boost_me")
+            assert updated is not None
+            assert updated.decay_start is not None, "decay_start should be set"
+            assert result["boosted_count"] >= 1
+
+            # decay_start 应该晚于 created_at（延长了 15 天）
+            if isinstance(entry.created_at, datetime):
+                created = entry.created_at
+            else:
+                created = datetime.fromisoformat(str(entry.created_at))
+            decay_start_dt = datetime.fromisoformat(updated.decay_start)
+            expected_extension = (decay_start_dt - created).days
+            assert expected_extension >= 15, f"Expected >=15 day extension, got {expected_extension}"
+        finally:
+            await store.close()
+
+    @pytest.mark.asyncio
+    async def test_decay_returns_stats(self):
+        """apply_decay 返回 {expired_count, boosted_count} 统计字典."""
+        from datetime import timedelta
+
+        store = MemoryStore(":memory:")
+        await store.open()
+        try:
+            # 创建会过期的记忆
+            old_date = datetime.now() - timedelta(days=120)
+            for i in range(3):
+                entry = MemoryEntry(
+                    namespace="user/facts", key=f"expire_{i}",
+                    value={"content": f"会过期的记忆 {i}"},
+                    layer="gist", salience=3.0,
+                    decay_curve="standard",
+                    created_at=old_date,
+                )
+                await store.save(entry)
+
+            # 创建会 boost 的记忆
+            now = datetime.now()
+            boost_entry = MemoryEntry(
+                namespace="user/facts", key="boost_stats",
+                value={"content": "统计测试 boost"},
+                layer="gist", salience=5.0,
+                decay_curve="standard",
+                access_count=5,
+                last_access=(now - timedelta(days=1)).isoformat(),
+                created_at=now - timedelta(days=50),
+            )
+            await store.save(boost_entry)
+
+            result = await store.apply_decay()
+
+            assert isinstance(result, dict), "Result should be a dict"
+            assert "expired_count" in result, "Should have expired_count key"
+            assert "boosted_count" in result, "Should have boosted_count key"
+            assert isinstance(result["expired_count"], int)
+            assert isinstance(result["boosted_count"], int)
+            assert result["expired_count"] >= 3
+            assert result["boosted_count"] >= 1
+        finally:
+            await store.close()

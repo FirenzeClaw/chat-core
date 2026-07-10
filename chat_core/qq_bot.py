@@ -137,8 +137,10 @@ async def run_bot(config_path: Path | None = None) -> None:
         emotion_brain=emotion_brain,
         race_tracker=race_tracker,
         subconscious_injector=subconscious,
+        qq_appid=appid,
+        qq_secret=secret,
     )
-    logger.info("BotAdapter 就绪 (全局双主脑 + 多子 Session)")
+    logger.info("BotAdapter 就绪 (全局双主脑 + 多子 Session + ProactiveSystem)")
 
     # ── QQ 消息回调 ───────────────────────────────────────
     async def on_qq_message(ctx):

@@ -13,6 +13,13 @@ import aiosqlite
 
 from chat_core.core.types import MemoryEntry, MemoryLink, RelationType, ChainedMemory, RecallChainConfig
 
+# ── 衰减常量 ──────────────────────────────────────────────
+DECAY_GIST_DAYS = 90
+DECAY_DETAIL_DAYS = 60
+AUTO_MIGRATE_DAYS = 30
+ACCESS_BOOST_DAYS = 7
+ACCESS_BOOST_MIN = 3
+
 # 中文分词（可选依赖）
 try:
     import jieba
@@ -37,6 +44,7 @@ class MemoryStore:
     def __init__(self, db_path: str | Path = "./data/memory.db"):
         self._db_path = Path(db_path)
         self._db: aiosqlite.Connection | None = None
+        self._decay_task: asyncio.Task | None = None
 
     async def open(self) -> None:
         """打开数据库，创建表结构，启用 WAL 模式及并发安全设置"""
@@ -51,9 +59,13 @@ class MemoryStore:
         await self._db.execute("PRAGMA cache_size=-8000")        # 8MB 缓存
         await self._create_tables()
         await self._migrate_schema_003()
+        await self._migrate_schema_decay()
         await self._db.commit()
 
     async def close(self) -> None:
+        if self._decay_task:
+            self._decay_task.cancel()
+            self._decay_task = None
         if self._db:
             await self._db.close()
             self._db = None
@@ -161,6 +173,16 @@ class MemoryStore:
         if "decay_curve" not in columns:
             await self._db.execute("ALTER TABLE memories ADD COLUMN decay_curve TEXT DEFAULT 'standard'")
 
+    async def _migrate_schema_decay(self) -> None:
+        """衰减系统: 添加 auto_migrate, decay_start 列"""
+        assert self._db
+        cursor = await self._db.execute("PRAGMA table_info('memories')")
+        columns = {row[1] for row in await cursor.fetchall()}
+        if "auto_migrate" not in columns:
+            await self._db.execute("ALTER TABLE memories ADD COLUMN auto_migrate INTEGER DEFAULT 0")
+        if "decay_start" not in columns:
+            await self._db.execute("ALTER TABLE memories ADD COLUMN decay_start TEXT")
+
     # ── CRUD ────────────────────────────────────────────────
 
     async def save(self, entry: MemoryEntry) -> None:
@@ -172,8 +194,8 @@ class MemoryStore:
             """INSERT OR REPLACE INTO memories
                (namespace, key, value, layer, salience, entity_type, topic_tags,
                 emotional_tags, created_at, updated_at, expires_at, ttl,
-                access_count, last_access, decay_curve)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                access_count, last_access, decay_curve, auto_migrate, decay_start)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 entry.namespace, entry.key,
                 json.dumps(entry.value, ensure_ascii=False),
@@ -187,6 +209,8 @@ class MemoryStore:
                 entry.access_count,
                 entry.last_access,
                 entry.decay_curve,
+                entry.auto_migrate,
+                entry.decay_start,
             ),
         )
         await self._db.commit()
@@ -878,6 +902,137 @@ class MemoryStore:
         except Exception:
             pass
 
+    # ── 衰减系统: 艾宾浩斯遗忘曲线 ──────────────────────────
+
+    async def apply_decay(self) -> dict:
+        """执行记忆衰减（艾宾浩斯遗忘曲线）。
+
+        规则:
+        - gist 层: 默认 90 天, 受 salience 调制延长
+          · salience ≤ 5: 90 天过期
+          · salience > 5 且 ≤ 7: 窗口延长 50% (135 天)
+          · salience > 7: 窗口加倍 (180 天)
+        - detail 层: >30 天 auto_migrate, >60 天过期
+        - decay_curve='deep': 不衰减
+        - 高频访问 boost: 7 天 ≥3 次 → decay_start 延长 15 天
+
+        返回: {expired_count, boosted_count}
+        """
+        from datetime import timedelta
+
+        assert self._db
+        now = datetime.now()
+        now_iso = now.isoformat()
+
+        expired_count = 0
+        boosted_count = 0
+
+        # ── 1. detail 层衰减 ──
+        # > AUTO_MIGRATE_DAYS 天 → 标记 auto_migrate=1
+        cutoff_30 = (now - timedelta(days=AUTO_MIGRATE_DAYS)).isoformat()
+        await self._db.execute(
+            """UPDATE memories SET auto_migrate = 1
+               WHERE layer = 'detail' AND decay_curve = 'standard'
+               AND auto_migrate = 0
+               AND created_at < ?""",
+            (cutoff_30,),
+        )
+
+        # > DECAY_DETAIL_DAYS 天 且 auto_migrate=1 → 过期
+        cutoff_60 = (now - timedelta(days=DECAY_DETAIL_DAYS)).isoformat()
+        cursor = await self._db.execute(
+            """UPDATE memories SET expires_at = ?
+               WHERE (expires_at IS NULL OR expires_at > ?)
+               AND layer = 'detail' AND auto_migrate = 1
+               AND COALESCE(decay_start, created_at) < ?""",
+            (now_iso, now_iso, cutoff_60),
+        )
+        expired_count += cursor.rowcount
+
+        # ── 2. gist 层衰减 (salience 调制) ──
+        # salience ≤ 5: 90 天
+        cutoff_90 = (now - timedelta(days=DECAY_GIST_DAYS)).isoformat()
+        cursor = await self._db.execute(
+            """UPDATE memories SET expires_at = ?
+               WHERE (expires_at IS NULL OR expires_at > ?)
+               AND layer = 'gist' AND decay_curve = 'standard'
+               AND salience <= 5
+               AND COALESCE(decay_start, created_at) < ?""",
+            (now_iso, now_iso, cutoff_90),
+        )
+        expired_count += cursor.rowcount
+
+        # salience > 5 且 ≤ 7: 135 天
+        cutoff_135 = (now - timedelta(days=int(DECAY_GIST_DAYS * 1.5))).isoformat()
+        cursor = await self._db.execute(
+            """UPDATE memories SET expires_at = ?
+               WHERE (expires_at IS NULL OR expires_at > ?)
+               AND layer = 'gist' AND decay_curve = 'standard'
+               AND salience > 5 AND salience <= 7
+               AND COALESCE(decay_start, created_at) < ?""",
+            (now_iso, now_iso, cutoff_135),
+        )
+        expired_count += cursor.rowcount
+
+        # salience > 7: 180 天
+        cutoff_180 = (now - timedelta(days=DECAY_GIST_DAYS * 2)).isoformat()
+        cursor = await self._db.execute(
+            """UPDATE memories SET expires_at = ?
+               WHERE (expires_at IS NULL OR expires_at > ?)
+               AND layer = 'gist' AND decay_curve = 'standard'
+               AND salience > 7
+               AND COALESCE(decay_start, created_at) < ?""",
+            (now_iso, now_iso, cutoff_180),
+        )
+        expired_count += cursor.rowcount
+
+        # ── 3. deep 曲线: 永不衰减 (by design, no-op) ──
+
+        # ── 4. 高频访问 boost ──
+        cutoff_7d = (now - timedelta(days=ACCESS_BOOST_DAYS)).isoformat()
+        cursor = await self._db.execute(
+            """SELECT namespace, key, created_at, decay_start FROM memories
+               WHERE decay_curve = 'standard'
+               AND access_count >= ?
+               AND last_access >= ?
+               AND (expires_at IS NULL OR expires_at > ?)""",
+            (ACCESS_BOOST_MIN, cutoff_7d, now_iso),
+        )
+        boost_rows = await cursor.fetchall()
+        for row in boost_rows:
+            base_str = row["decay_start"] or row["created_at"]
+            try:
+                base_dt = datetime.fromisoformat(base_str)
+                new_start = (base_dt + timedelta(days=15)).isoformat()
+                await self._db.execute(
+                    "UPDATE memories SET decay_start = ? WHERE namespace = ? AND key = ?",
+                    (new_start, row["namespace"], row["key"]),
+                )
+                boosted_count += 1
+            except (ValueError, OSError):
+                pass
+
+        await self._db.commit()
+        return {"expired_count": expired_count, "boosted_count": boosted_count}
+
+    async def start_decay_tick(self, interval: int = 3600) -> None:
+        """启动后台衰减定时任务（每小时执行一次 apply_decay）。
+
+        调用方需持有 running event loop。任务在后台运行，store.close() 时取消。
+        """
+        async def _tick_loop() -> None:
+            while self._db is not None:
+                try:
+                    await asyncio.sleep(interval)
+                    if self._db is not None:
+                        await self.apply_decay()
+                except asyncio.CancelledError:
+                    break
+                except Exception:
+                    pass  # 静默失败，下次重试
+
+        self._decay_task = asyncio.create_task(_tick_loop())
+
     async def query(
         self,
         namespace_prefix: str,
@@ -937,4 +1092,6 @@ class MemoryStore:
             access_count=int(row["access_count"]) if row["access_count"] is not None else 0,
             last_access=row["last_access"] if row["last_access"] else None,
             decay_curve=row["decay_curve"] if row["decay_curve"] else "standard",
+            auto_migrate=int(row["auto_migrate"]) if row["auto_migrate"] is not None else 0,
+            decay_start=row["decay_start"] if row["decay_start"] else None,
         )

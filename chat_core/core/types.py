@@ -264,6 +264,9 @@ class MemoryEntry:
     access_count: int = 0
     last_access: str | None = None
     decay_curve: str = "standard"
+    # 衰减系统字段
+    auto_migrate: int = 0
+    decay_start: str | None = None
 
 
 @dataclass
