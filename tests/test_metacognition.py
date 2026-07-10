@@ -123,3 +123,102 @@ class TestMetacognitionReport:
         assert r.insight_text == "I noticed a pattern"
         assert r.confidence == 0.75
         assert r.param_overrides.inner_thoughts_mode == "brief"
+
+
+# ── Task 5: 触发逻辑测试 ────────────────────────────────────
+
+from chat_core.systems.metacognition import MetacognitionEngine
+from chat_core.core.types import DecisionType
+
+
+class TestMetacognitionEngineTriggers:
+    """MetacognitionEngine.check_triggers() 测试"""
+
+    @pytest.fixture
+    def engine(self):
+        return MetacognitionEngine()
+
+    def test_periodic_trigger(self, engine):
+        """定期触发：turn_counter % N == 0"""
+        assert engine.check_triggers(5, None, False, None) is True
+        assert engine.check_triggers(10, None, False, None) is True
+        assert engine.check_triggers(15, None, False, None) is True
+
+    def test_periodic_not_trigger_on_non_interval(self, engine):
+        """非 N 的倍数不触发"""
+        assert engine.check_triggers(1, None, False, None) is False
+        assert engine.check_triggers(2, None, False, None) is False
+        assert engine.check_triggers(7, None, False, None) is False
+
+    def test_review_streak_trigger(self, engine):
+        """审查连续 3 轮同结论 → 触发"""
+        # round 1
+        assert engine.check_triggers(1, DecisionType.CORRECT, False, None) is False
+        # round 2
+        assert engine.check_triggers(2, DecisionType.CORRECT, False, None) is False
+        # round 3 → trigger
+        assert engine.check_triggers(3, DecisionType.CORRECT, False, None) is True
+
+    def test_review_streak_resets_on_different(self, engine):
+        """审查结论改变 → 计数器重置"""
+        assert engine.check_triggers(1, DecisionType.CORRECT, False, None) is False
+        assert engine.check_triggers(2, DecisionType.CORRECT, False, None) is False
+        # 改变结论
+        assert engine.check_triggers(3, DecisionType.SILENCE, False, None) is False
+        # 重置后重新计数
+        assert engine.check_triggers(4, DecisionType.SILENCE, False, None) is False
+        assert engine.check_triggers(5, DecisionType.SILENCE, False, None) is True  # 第 3 个 SILENCE + 定期
+
+    def test_defense_streak_trigger(self, engine):
+        """防御连续 2 轮 → 触发"""
+        assert engine.check_triggers(1, None, True, None) is False
+        assert engine.check_triggers(2, None, True, None) is True
+
+    def test_defense_streak_resets(self, engine):
+        """防御中断 → 计数器重置"""
+        assert engine.check_triggers(1, None, True, None) is False
+        assert engine.check_triggers(2, None, False, None) is False  # 无防御
+        assert engine.check_triggers(3, None, True, None) is False  # 重新计数
+
+    def test_self_criticism_streak_trigger(self, engine):
+        """自我批评连 3 轮 → 触发"""
+        assert engine.check_triggers(1, None, False, "不该这么说...") is False
+        assert engine.check_triggers(2, None, False, "又说错了...") is False
+        assert engine.check_triggers(3, None, False, "太机械了...") is True
+
+    def test_self_criticism_resets(self, engine):
+        """自我批评中断 → 计数器重置"""
+        assert engine.check_triggers(1, None, False, "不该这么说...") is False
+        assert engine.check_triggers(2, None, False, "今天天气不错") is False  # 无自我批评
+        assert engine.check_triggers(3, None, False, "又说错了...") is False  # 重新计数
+
+    def test_compound_delta_trigger(self, engine):
+        """|Δcompound| > 0.4 → 即时触发（情绪冲击）"""
+        assert engine.check_triggers(3, None, False, None, compound_delta=0.5) is True
+
+    def test_compound_delta_below_threshold_no_trigger(self, engine):
+        """|Δcompound| ≤ 0.4 → 不触发"""
+        assert engine.check_triggers(3, None, False, None, compound_delta=0.3) is False
+        assert engine.check_triggers(3, None, False, None, compound_delta=0.4) is False
+
+    def test_compound_delta_negative_triggers(self, engine):
+        """负向情绪冲击同样触发"""
+        assert engine.check_triggers(3, None, False, None, compound_delta=-0.5) is True
+
+    def test_counters_reset_after_trigger(self, engine):
+        """触发后计数器全部重置"""
+        # 触发审查连判
+        engine.check_triggers(1, DecisionType.CORRECT, False, None)
+        engine.check_triggers(2, DecisionType.CORRECT, False, None)
+        assert engine.check_triggers(3, DecisionType.CORRECT, False, None) is True
+        # 触发后计数器应归零
+        assert engine._review_streak_counter == 0
+        assert engine._defense_streak_counter == 0
+        assert engine._self_criticism_counter == 0
+
+    def test_none_review_decision_resets_counter(self, engine):
+        """None 审查决策重置计数器"""
+        engine.check_triggers(1, DecisionType.CORRECT, False, None)
+        engine.check_triggers(2, DecisionType.CORRECT, False, None)
+        assert engine.check_triggers(3, None, False, None) is False
+        assert engine._review_streak_counter == 0
