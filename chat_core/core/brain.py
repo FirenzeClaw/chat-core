@@ -516,6 +516,38 @@ class LogicBrain:
             logger.warning(f"Metacognition pass failed: {e}")
             return None
 
+    # ── Spec 010: 自我叙事 pass ───────────────────────────
+
+    async def narrative_pass(self, context: str) -> str | None:
+        """生成/更新自我叙述：单次 LLM 调用，返回叙述文本。
+
+        复用 LogicBrain 的 DeepSeek Pro，纯文本调用（无 tools）。
+        失败返回 None（静默降级）。
+        """
+        prompt = (
+            "[自我叙事更新] 请根据以下上下文，生成一段连贯的自我叙述。\n\n"
+            f"{context}"
+        )
+
+        messages = [Message(role="user", content=prompt)]
+
+        cfg = get_config()
+        api_cfg = cfg.brain_api_config("logic")
+
+        try:
+            result = await self._provider.chat(
+                messages=messages,
+                model=api_cfg.get("model", "deepseek-v4-pro"),
+                temperature=api_cfg.get("temperature", 0.3),
+                max_tokens=512,
+                reasoning_effort=api_cfg.get("reasoning_effort", "max"),
+            )
+            text = result.content.strip()
+            return text if text else None
+        except Exception as e:
+            logger.warning(f"Narrative pass failed: {e}")
+            return None
+
 
 # ── 情感主脑 ──────────────────────────────────────────────
 
