@@ -216,7 +216,7 @@ namespace (L4):        salience += 0.10
 
 ```
 短期记忆
-  ├─ 条件: salience < 5 且 access_count < 3
+  ├─ 条件: 尚未巩固 — NOT (salience ≥ 5 AND access_count ≥ 3)
   ├─ 存储: short_term/* namespace
   ├─ 特点: 近 10 条 (写入时裁剪), 尚未巩固, 联锁时排序靠后
   └─ 晋升条件: salience ≥ 5 且 access_count ≥ 3

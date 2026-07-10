@@ -31,7 +31,7 @@
 
 ## Notes
 
-- All 22 FRs are testable and traceable to the design document
+- All 24 FRs are testable and traceable to the design document
 - 8 success criteria are measurable and technology-agnostic
 - 5 user scenarios cover primary flows + edge cases (no memory, cross-scene)
 - Out of Scope section clearly bounds what is NOT included

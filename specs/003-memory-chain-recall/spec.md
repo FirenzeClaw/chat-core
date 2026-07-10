@@ -106,6 +106,8 @@
 - **FR-04**: 子Session (ReActLoop) recall MUST 使用配置 top_n=3, extensions=[2,1,0]
 - **FR-05**: 同一记忆在多条延伸链中重复出现时，MUST 仅保留优先级最高 (links > tags > entity > namespace) 的来源
 - **FR-06**: 所有延伸检索 MUST 遵守 namespace_prefix 限制（子Session 为 user/{uid} 和 short_term）
+- **FR-06a**: 已有的 MemoryStore.search() 方法 MUST 保持原有行为不变，search_chained() 为新增入口，不影响现有调用方
+- **FR-06b**: 延伸检索遇到已删除或已过期的目标记忆时，MUST 静默跳过（不计入配额），自动降级到下一级 fallback
 
 ### Recall 深刻化
 
@@ -115,7 +117,7 @@
 
 ### 记忆分级
 
-- **FR-10**: 系统 MUST 维护三级记忆：短期记忆 (salience<5 且 access_count<3)、长期记忆 (salience≥5 且 access_count≥3)、深刻记忆 (salience≥7)
+- **FR-10**: 系统 MUST 维护三级记忆：短期记忆（尚未巩固，不满足长期条件）、长期记忆 (salience≥5 且 access_count≥3)、深刻记忆 (salience≥7)。新创建的条目默认归类为短期记忆
 - **FR-11**: 短期记忆存储于 short_term/* namespace，MUST 自动裁剪至最多 10 条（按 salience 降序保留）
 - **FR-12**: 当短期记忆中某条目同时满足 salience≥5 且 access_count≥3 时，MUST 自动迁移到 user/* namespace
 - **FR-13**: 当长期记忆中某条目 salience≥7 时，MUST 标记 decay_curve='deep'，成为深刻记忆
@@ -171,6 +173,7 @@
 5. 情绪注解文本由 emotional_tags JSON 字段自动生成，不依赖 LLM
 6. 主脑 recall 配置和子Session recall 配置为常量，不可运行时动态调整
 7. 联锁延伸检索每级的上限 (max_per_level) 对主脑为 3，子Session 为 2
+8. 已有数据库的现存条目，access_count 和 last_access 缺省为 0/NULL，不影响检索（仅在首次被 recap 命中后开始累积）
 
 ---
 
