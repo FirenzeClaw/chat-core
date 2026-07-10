@@ -34,7 +34,7 @@
 
 - [ ] T001 [P] Add `ChainedMemory` and `RecallChainConfig` dataclasses to `chat_core/core/types.py` — ChainedMemory: entry, chain_level, chain_parent_key, relevance_score; RecallChainConfig: top_n, extensions, max_per_level, namespace_prefix
 - [ ] T002 [P] Add `LOGIC_BRAIN_CHAIN_CONFIG` and `SUB_SESSION_CHAIN_CONFIG` constants to `chat_core/core/types.py` — 主脑 top_n=5 extensions=[3,2,2,1,0] max_per_level=3; 子Session top_n=3 extensions=[2,1,0] max_per_level=2
-- [ ] T003 Schema migration in `chat_core/systems/memory.py` → `MemoryStore.open()`: add `access_count INTEGER DEFAULT 0` and `last_access TEXT` columns (ALTER TABLE with existence check, idempotent)
+- [ ] T003 Schema migration in `chat_core/systems/memory.py` → `MemoryStore.open()`: add `access_count INTEGER DEFAULT 0`, `last_access TEXT`, and `decay_curve TEXT DEFAULT 'standard'` columns (ALTER TABLE with existence check, idempotent)
 - [ ] T004 Validate schema migration: launch bot or run `python -c "from chat_core.systems.memory import MemoryStore; import asyncio; asyncio.run(MemoryStore(':memory:').open())"` and verify new columns exist
 
 **Checkpoint**: Types importable, schema columns exist.
@@ -114,7 +114,8 @@
 
 ### Implementation
 
-- [ ] T030 [US3] Update `LogicBrain._execute_recall()` in `chat_core/core/brain.py` — replace `self._memory.search(query, top_n=10)` with `self._memory.search_chained(query, chain_config=from types import LOGIC_BRAIN_CHAIN_CONFIG)`. The method already returns `list[MemoryEntry]`; change return type to `str` for natural language output. (FR-20)
+- [ ] T030 [US3] Update `LogicBrain._execute_recall()` in `chat_core/core/brain.py` — replace `self._memory.search(query, top_n=10)` with `self._memory.search_chained(query, chain_config=from types import LOGIC_BRAIN_CHAIN_CONFIG)`. **Keep return type as `list[MemoryEntry]`** — the chained results are stored as MemoryEntry list for internal use. Natural language formatting happens at injection boundary. (FR-20)
+- [ ] T030a [US3] Update `LogicBrain.think_inject()` in `chat_core/core/brain.py` — when building injection context from recall results, call `_format_recall_result(chained_entries)` to convert to natural language before injecting into sub-session. The raw `list[MemoryEntry]` remains available for structured review.
 - [ ] T031 [US3] Update `register_sub_session_tools()` in `chat_core/core/loop.py` — add optional `chain_config: RecallChainConfig = None` parameter. If provided, recall handler uses `search_chained(query, chain_config)`. If not provided, fallback to old `search(query, top_n=5)` for backward compat.
 - [ ] T032 [US3] Update recall tool description in `chat_core/core/loop.py` — change from "从记忆中检索相关信息。只读。" to "从记忆中检索信息。会自动追溯关联记忆。只读，仅能访问你的记忆和公共信息。" when chain_config is provided. (FR-21, FR-22)
 - [ ] T033 [US3] Update `BotAdapter._get_or_create_sub_session()` in `chat_core/qq/adapter.py` — construct `RecallChainConfig(top_n=3, extensions=[2,1,0], max_per_level=2, namespace_prefix=f"user/{user_id}")`. Pass to `register_sub_session_tools(tools, loop, chain_config=config)`. Add `user_id` parameter. (FR-21)
@@ -189,11 +190,11 @@ After MVP: `search_chained()` returns natural language chained results. Salience
 ## Format Validation
 
 All tasks follow `- [ ] [TaskID] [P?] [Story?] Description with file path` format.
-- 41 tasks total
+- 42 tasks total
 - Phase 1 (Setup): 4 tasks (T001-T004)
 - Phase 2 (Foundational): 9 tasks (T005-T013)
 - Phase 3 (US1): 7 tasks (T014-T020)
 - Phase 4 (US2): 9 tasks (T021-T029)
-- Phase 5 (US3): 8 tasks (T030-T037)
+- Phase 5 (US3): 9 tasks (T030-T037)
 - Phase 6 (Polish): 4 tasks (T038-T041)
 - Parallelizable [P]: 21 tasks

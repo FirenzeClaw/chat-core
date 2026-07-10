@@ -113,7 +113,7 @@
 
 - **FR-07**: 每次 recall 返回的每条记忆（含延伸链条中的），其 access_count MUST 自动 +1, last_access 更新为当前时间
 - **FR-08**: 每条命中记忆的 salience MUST 按链深度递增：direct match +0.50, links +0.30, topic_tags +0.20, entity +0.15, namespace +0.10。salience 上限为 10.0
-- **FR-09**: schema 中 MUST 保留已有的 salience 字段 (REAL DEFAULT 5.0) 并使其生效；MUST 新增 access_count (INTEGER DEFAULT 0) 和 last_access (TEXT) 字段
+- **FR-09**: schema 中 MUST 保留已有的 salience 字段 (REAL DEFAULT 5.0) 并使其生效；MUST 新增 access_count (INTEGER DEFAULT 0)、last_access (TEXT) 和 decay_curve (TEXT DEFAULT 'standard') 字段
 
 ### 记忆分级
 
@@ -128,7 +128,7 @@
 - **FR-15**: 回溯文本 MUST 以"【记忆回溯】"开头，第一条记忆用"我记得"开头
 - **FR-16**: 延伸记忆 MUST 使用随机轮换的连接词："还想起"、"哦对"、"说到这个"、"这让我想起"、"顺便一提"、"对了"、"说起来"、"那次也是"
 - **FR-17**: 有 emotional_tags 的记忆 MUST 在内容后附加情绪注解，格式为"（{情绪描述}）"，无情绪标签的记忆不添加注解
-- **FR-18**: 多条回溯记忆的情绪一致性高时，MUST 在末尾添加情绪推演，如"这些记忆让我觉得他最近成就感和压力并存。"
+- **FR-18**: 多条回溯记忆的情绪一致性高时（dominant 情绪维度占比 > 60%），MUST 在末尾添加情绪推演，如"这些记忆让我觉得他最近成就感和压力并存。"
 - **FR-19**: 检索无结果时 MUST 返回人性化文本（如"目前没什么特别的记忆浮现。"），不返回空数组或"No results"
 
 ### 主脑/子Session recall 隔离
@@ -173,7 +173,7 @@
 5. 情绪注解文本由 emotional_tags JSON 字段自动生成，不依赖 LLM
 6. 主脑 recall 配置和子Session recall 配置为常量，不可运行时动态调整
 7. 联锁延伸检索每级的上限 (max_per_level) 对主脑为 3，子Session 为 2
-8. 已有数据库的现存条目，access_count 和 last_access 缺省为 0/NULL，不影响检索（仅在首次被 recap 命中后开始累积）
+8. 已有数据库的现存条目，access_count 和 last_access 缺省为 0/NULL，不影响检索（仅在首次被 recall 命中后开始累积）
 
 ---
 

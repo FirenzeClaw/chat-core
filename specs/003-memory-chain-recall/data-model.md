@@ -104,6 +104,7 @@ SUB_SESSION_CHAIN_CONFIG = RecallChainConfig(
 -- 新增列 (已有 DEFAULT 值，对现存行透明)
 ALTER TABLE memories ADD COLUMN access_count INTEGER DEFAULT 0;
 ALTER TABLE memories ADD COLUMN last_access TEXT;
+ALTER TABLE memories ADD COLUMN decay_curve TEXT DEFAULT 'standard';
 
 -- 已有列 salience 已存在: REAL DEFAULT 5.0 (无变更)
 ```

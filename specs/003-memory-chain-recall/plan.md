@@ -75,28 +75,17 @@ chat_core/
   - 每级受 namespace_prefix + max_per_level 约束 (FR-06)
   - 断链静默跳过 (FR-06b)
 - [ ] `_dedup_by_quality()` 全局去重: priority links>tags>entity>namespace (FR-05)
-- [ ] salience + access_count 深刻化: 命中即递增，按链深度衰减 (FR-07, FR-08)
-- [ ] `_format_recall_result()` 自然语言格式化:
-  - 连接词随机轮换 (FR-16)
-  - 情绪注解 (FR-17)
-  - 情绪推演 (FR-18)
-  - 空记忆人性化文本 (FR-19)
-- [ ] `_migrate_short_to_long()` + `_trim_short_term()` 记忆分级 (FR-10~13)
+- [ ] salience + access_count 深刻化: 命中即递增，按链深度衰减 (FR-07, FR-08) — **见 Phase 2 (US2)**
+- [ ] `_format_recall_result()` 自然语言格式化: 连接词、情绪注解、情绪推演、空结果文本 (FR-15~19)
+- [ ] `_migrate_short_to_long()` + `_trim_short_term()` + `_mark_deep_memory()` 记忆分级 (FR-10~13) — **见 Phase 2 (US2)**
 - [ ] `search()` 旧 API 保持不变 (FR-06a)
 
 **Tests** (`tests/test_memory.py`):
 - [ ] `test_search_chained_main_brain` — 验证 5+3+2+2+1+0 条链
 - [ ] `test_search_chained_sub_session` — 验证 3+2+1 条链 + namespace 限制
-- [ ] `test_extend_chain_links` — L1 memory_links 延伸
-- [ ] `test_extend_chain_topic_tags` — L2 topic_tags 延伸
-- [ ] `test_extend_chain_entity_type` — L3 entity_type 延伸
-- [ ] `test_extend_chain_namespace` — L4 namespace 延伸
+- [ ] `test_extend_chain_levels` — 4 级 fallback 各自返回正确条目
 - [ ] `test_dedup_across_chains` — 去重保留最高 priority
 - [ ] `test_broken_link_skip` — 断链静默跳过 + 降级
-- [ ] `test_salience_boost` — 命中 +0.5, 链深度递减
-- [ ] `test_access_count_increment` — 每次命中 +1
-- [ ] `test_migrate_short_to_long` — salience≥5 + access≥3 → 迁移
-- [ ] `test_trim_short_term` — 裁剪至 10 条
 - [ ] `test_natural_language_output` — 连接词、情绪注解、推演
 - [ ] `test_empty_recall_human_text` — 空结果人性化文本
 - [ ] `test_old_search_unchanged` — 旧 API 不受影响
