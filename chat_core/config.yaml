@@ -73,6 +73,42 @@ systems:
     contagion_strength: 0.1
     introspect_threshold: 0.3   # 自省触发：双脑余弦距离
 
+    # Spec 005: 复合情绪
+    compound:
+      enabled: true
+      interaction_threshold: 0.3
+      interaction_tick_coeff: 1.0
+      decay_halflife_ratio: 0.5
+
+    # Spec 005: 防御机制
+    defense:
+      enabled: true
+      base_prob_formula: "1.0 - impulsiveness"
+      condition_modifiers:
+        self_threat_boost: 2.0
+        repeat_error_boost: 1.5
+        emotion_shock_boost: 2.0
+      type_weights:
+        denial: 0.35
+        rationalize: 0.40
+        projection: 0.25
+
+    # Spec 005: 脆弱感
+    vulnerability:
+      enabled: true
+      thresholds:
+        guilt: 0.7
+        anxiety: 0.7
+        sadness: 0.7
+        disappointment: 0.7
+        resentment: 0.7
+        bittersweet: 0.7
+      modulation:
+        defense_prob: 0.3
+        self_disclosure: 2.0
+      min_relationship_stage: friend
+      cooldown_turns: 5
+
   personality:
     initial:
       curiosity: 0.7
@@ -92,10 +128,22 @@ systems:
       llm_rerank_timeout: 1.0
       spread_activation_depth: 2
     decay:
-      detail_auto_migrate_days: 60
-      gist_expire_salience_5: 90
-      gist_expire_salience_7: 135
-      gist_expire_salience_10: 180
+      enabled: true               # false = 不衰减不降级 (回退到 Spec 003 原始行为)
+      formula: "power_law"        # power_law | none
+      standard_beta: 0.01         # standard 曲线衰减系数
+      deep_beta: 0.001            # deep 曲线衰减系数 (10× 慢)
+      alpha: 0.5                  # 幂律曲率 (0<α≤1)
+      migration:
+        short_to_long_salience: 5
+        long_to_short_salience: 3
+        deep_salience: 7
+        deep_fallback: 5
+      trim_short_max: 10
+      # 旧 TTL 过期清理参数 (apply_decay 仍使用)
+      legacy_detail_auto_migrate_days: 60
+      legacy_gist_expire_salience_5: 90
+      legacy_gist_expire_salience_7: 135
+      legacy_gist_expire_salience_10: 180
 
   boredom:
     tick_interval: 30
@@ -109,11 +157,104 @@ systems:
     decay_per_hour: 0.05
 
   attention:
+    state_machine:
+      initial_focus: 0.9
+      state_thresholds:
+        focused: 0.6
+        drifting: 0.3
+      boosts:
+        user_message_dull: 0.20
+        emotion_positive: 0.10
+        emotion_shock: 0.30
+        memory_strong_hit: 0.25
+        topic_match_strong: 0.08
+        topic_match_weak: 0.05
+        intent_detected: 0.05
+      penalties:
+        emotion_negative: 0.10
+        memory_miss: 0.03
+        short_reply_streak: 0.10
+        correction_triggered: 0.05
+        per_segment_sent: 0.02
+      transition_probabilities:
+        drifting_to_focused_on_message: 0.7
+        dull_to_drifting_on_message: 0.5
+        dull_to_drifting_on_shock: 0.8
+        focused_to_drifting_on_race3: 0.7
+        focused_to_dull_on_race5: 0.6
+        drifting_to_dull_on_race5: 0.8
+    drift:
+      decay_rate_focused: 0.001
+      decay_rate_drifting: 0.002
+      decay_rate_dull: 0.0005
+    fatigue:
+      max_turns: 50
+      decay_acceleration: 0.5
+    boredom_link:
+      tick_interval_focused: 30
+      tick_interval_drifting: 20
+      tick_interval_dull: 15
+      threshold_dull: 0.40
     baseline:
       logic: {focus: 0.8, dominance: 0.7}
       emotion: {focus: 0.7, dominance: 0.5}
       sub: {focus: 0.9, dominance: 0.6}
-    drift_decay_rate: 0.01      # 每秒衰减
+    drift_decay_rate: 0.001      # 向后兼容：每秒衰减 (QQ Bot 跨 turn 间隔可达分钟级)
+
+  energy:
+    enabled: true
+    initial: 0.9
+    consumption:
+      normal_turn: 0.03
+      long_reply_threshold: 3
+      long_reply: 0.06
+      emotion_shock: 0.10
+      correction: 0.05
+      defense: 0.04
+    recovery:
+      interval: 60
+      rate_high: 0.02
+      rate_mid: 0.01
+      rate_low: 0.005
+    exit_threshold: 0.15
+    defense_interaction:
+      project_relief: 0.02
+      denial_drain: 0.02
+
+  subjective_time:
+    enabled: true
+    speed_modifiers:
+      attention:
+        focused: 0.3
+        drifting: 0.8
+        dull: 2.0
+      emotion:
+        joy_threshold: 0.5
+        sadness_threshold: 0.5
+        gratification_threshold: 0.4
+      interest:
+        match_threshold: 0.7
+
+  metacognition:
+    enabled: true
+    periodic_interval: 5          # 每 N 轮定期触发
+    anomaly_detection:
+      review_streak: 3            # 审查连续 ≥3 同结论
+      defense_streak: 2           # 防御连续 ≥2 轮
+      self_criticism_streak: 3    # inner_thoughts 连 ≥3 含自我批评
+      self_criticism_keywords:    # 触发关键词
+        - "不该这么说"
+        - "又说错了"
+        - "太机械了"
+        - "没意思"
+        - "不想聊了"
+    param_limits:
+      review_threshold_range: [0.35, 0.65]
+      defense_prob_range: [0.1, 0.95]
+      interest_mod_range: [-0.3, 0.3]
+      emotion_threshold_range: [0.2, 0.4]
+    confidence_threshold: 0.6     # 低于此只应用文本，不调参数
+    override_expiry_turns: 5      # 参数覆盖 N 轮后自动过期
 
 # Prompt 文件路径
 prompts:

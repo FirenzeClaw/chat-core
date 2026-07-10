@@ -208,6 +208,10 @@ class Config:
     def attention_config(self) -> dict[str, Any]:
         return self.systems.get("attention", {})
 
+    def metacognition_config(self) -> dict[str, Any]:
+        """返回 systems.metacognition 配置"""
+        return self.systems.get("metacognition", {})
+
     def qq_config(self) -> dict[str, Any]:
         return self._data.get("qq_bot", {})
 
