@@ -1,10 +1,11 @@
-"""Interest system — FuzzyParam, silence accumulator, and InterestModel (Phase 5, T039 + Phase 7, T054)"""
+"""Interest system — FuzzyParam, silence accumulator, and InterestModel (Phase 5, T039 + Phase 7, T054 + 注意力状态机 §5 联动)"""
 
 from __future__ import annotations
 
 import random
 import time
 from datetime import datetime
+from typing import Any
 
 
 class FuzzyParam:
@@ -104,10 +105,11 @@ class SilenceAccumulator:
 
 
 class InterestModel:
-    """话题兴趣追踪模型 (Phase 7, T054).
+    """话题兴趣追踪模型 (Phase 7, T054 + 注意力状态机 §5 联动).
 
     追踪每次对话中话题出现的次数，累积权重，
-    支持按小时衰减。用于驱动主动行为中的兴趣话题选择。
+    支持按小时衰减。支持 DULL 态情绪调制兴趣触发概率。
+    用于驱动主动行为中的兴趣话题选择。
 
     Attributes:
         topic_trigger_threshold: 同一话题触发阈值（默认 3 次提及）
@@ -120,10 +122,14 @@ class InterestModel:
         topic_trigger_threshold: int = 3,
         topic_weight_increment: float = 0.1,
         decay_per_hour: float = 0.05,
+        attention_model: Any = None,
     ) -> None:
         self.topic_trigger_threshold = topic_trigger_threshold
         self.topic_weight_increment = topic_weight_increment
         self.decay_per_hour = decay_per_hour
+
+        # 注意力状态机联动（可选，向后兼容）
+        self._attention_model = attention_model
 
         # 内部状态: {topic: {"count": int, "weight": float}}
         self._topics: dict[str, dict[str, float]] = {}
@@ -204,6 +210,70 @@ class InterestModel:
             reverse=True,
         )
         return [(topic, float(entry["weight"])) for topic, entry in sorted_topics[:n]]
+
+    # ── 情绪调制 (注意力状态机 §5.2) ──────────────────────────
+
+    def get_mood_modifier(self, emotion_engine: Any) -> float:
+        """DULL 态下根据 sub 脑 valence 返回兴趣触发调制系数。
+
+        仅在 DULL 态生效，非 DULL 态返回 1.0（无调制）。
+
+        Args:
+            emotion_engine: EmotionEngine 实例
+
+        Returns:
+            调制系数:
+            - 情绪消极 (valence < -0.2): ×0.5  (提不起劲)
+            - 情绪中性 (-0.2~0):        ×0.8
+            - 情绪积极 (valence > 0):    ×1.2  (情绪推一把就能振作)
+            - 情绪剧烈波动 (|Δ| > 0.5):  ×2.0  + focus boost (冲击式唤醒)
+        """
+        if self._attention_model is None or emotion_engine is None:
+            return 1.0
+        try:
+            from chat_core.core.types import AttentionStateEnum
+            if self._attention_model.get_state_enum("sub") != AttentionStateEnum.DULL:
+                return 1.0
+            sub_state = emotion_engine.get_state("sub")
+            valence = (sub_state.joy + sub_state.trust) / 2.0
+            # 剧烈波动检测：joy 和 sadness 的差值
+            if abs(sub_state.joy - sub_state.sadness) > 0.5:
+                return 2.0
+            if valence < -0.2:
+                return 0.5
+            elif valence <= 0:
+                return 0.8
+            else:
+                return 1.2
+        except Exception:
+            return 1.0
+
+    def match(self, topic: str, emotion_engine: Any = None, meta_overrides: Any = None) -> float:
+        """匹配话题并返回调制后的兴趣触发概率。
+
+        match = get_interest_weight(topic) × mood_modifier
+
+        Spec 006: 若提供 meta_overrides，对匹配的 topic 应用 interest_modulations 偏移。
+
+        Args:
+            topic: 话题名称
+            emotion_engine: EmotionEngine 实例（用于情绪调制）
+            meta_overrides: Spec 006 MetaParamOverrides 实例
+
+        Returns:
+            调制后的触发概率 [0.0, 1.0]
+        """
+        base = self.get_interest_weight(topic)
+        modifier = self.get_mood_modifier(emotion_engine)
+        result = min(1.0, base * modifier)
+
+        # Spec 006: 元认知兴趣调制
+        if meta_overrides is not None:
+            modulations = getattr(meta_overrides, "interest_modulations", {})
+            offset = modulations.get(topic.lower(), 0.0)
+            result = max(0.0, min(1.0, result + offset))
+
+        return result
 
     # ── 衰减 ──────────────────────────────────────────────────
 
