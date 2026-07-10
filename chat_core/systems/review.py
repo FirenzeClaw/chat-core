@@ -344,15 +344,23 @@ class ReviewSystem:
         self,
         logic_weight: float,
         emotion_weight: float,
+        meta_overrides: "MetaParamOverrides | None" = None,
+        turn_counter: int = 0,
     ) -> DecisionType:
-        """Weighted decision: combined = logic * 0.6 + emotion * 0.4.
+        """Weighted decision: combined = logic * 0.5 + emotion * 0.5.
 
-        > 0.5 → CORRECT (or TWISTED if logic > 0.8 and emotion < 0.3)
-        ≤ 0.5 → SILENCE
+        > threshold → CORRECT (or TWISTED if logic > 0.8 and emotion < 0.3)
+        ≤ threshold → SILENCE
+
+        Spec 006: threshold 由 meta_overrides.get_review_threshold() 动态计算。
         """
-        combined = logic_weight * 0.6 + emotion_weight * 0.4
+        combined = logic_weight * 0.5 + emotion_weight * 0.5
 
-        if combined > 0.5:
+        threshold = 0.5
+        if meta_overrides is not None:
+            threshold = meta_overrides.get_review_threshold(base=0.5, turn_counter=turn_counter)
+
+        if combined > threshold:
             # T038: Twisted state check
             if logic_weight > 0.8 and emotion_weight < 0.3:
                 return DecisionType.TWISTED
@@ -368,6 +376,7 @@ class ReviewSystem:
         inner_thoughts: str | None,
         memories: list[MemoryEntry],
         user_message: str,
+        **kwargs: Any,
     ) -> ReviewResult:
         """Execute the 3-layer review pipeline.
 
@@ -376,6 +385,8 @@ class ReviewSystem:
         3. Layer 3: For remaining candidates, LLM review (1s timeout).
         4. Tone review: heuristic keyword-based tone check.
         5. Weighted decision: combine logic + emotion weights.
+
+        Spec 006: 接受 meta_overrides 和 turn_counter 关键字参数传递到 _compute_decision。
         """
         review = ReviewResult()
         reply_text = " ".join(replies)
@@ -460,8 +471,12 @@ class ReviewSystem:
             review.emotion_verdict = "ok"
 
         # ── Weighted decision ────────────────────────────────
-        review.combined_weight = logic_weight * 0.6 + emotion_weight * 0.4
-        review.decision = self._compute_decision(logic_weight, emotion_weight)
+        review.combined_weight = logic_weight * 0.5 + emotion_weight * 0.5
+        review.decision = self._compute_decision(
+            logic_weight, emotion_weight,
+            meta_overrides=kwargs.get("meta_overrides"),
+            turn_counter=kwargs.get("turn_counter", 0),
+        )
 
         return review
 
