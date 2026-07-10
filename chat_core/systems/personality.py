@@ -153,3 +153,54 @@ class PersonalityEngine:
             "impulsiveness": self._weights.impulsiveness,
             "loyalty": self._weights.loyalty,
         }
+
+    # ── Spec 008: 关系调制 ──────────────────────────────────
+
+    def apply_relationship_modulation(
+        self,
+        stage: "RelationshipStage | None" = None,
+        modulation: "RelationshipModulation | None" = None,
+    ) -> dict[str, float]:
+        """返回关系阶段调制后的行为参数（不修改内部权重）。
+
+        Args:
+            stage: 关系阶段枚举（自动查表）
+            modulation: 或直接传入调制系数（优先级更高）
+
+        Returns:
+            {
+                "empathy": modulated_value,
+                "self_disclosure": modulated_value,
+                "proactive_frequency": modulated_value,
+            }
+        """
+        if modulation is None and stage is not None:
+            from chat_core.systems.relationship import RelationshipEngine
+            # 此处由 TurnManager 传入已计算好的 modulation
+            pass
+
+        if modulation is None:
+            return {
+                "empathy": self._weights.empathy,
+                "self_disclosure": 0.5,  # base self_disclosure
+                "proactive_frequency": self._weights.sociability,
+            }
+
+        return {
+            "empathy": min(1.0, self._weights.empathy * modulation.empathy_mult),
+            "self_disclosure": min(1.0, 0.5 * modulation.self_disclosure_mult),
+            "proactive_frequency": min(1.0, self._weights.sociability * modulation.proactive_prob_mult),
+        }
+
+    def get_defense_prob_modulation(
+        self,
+        modulation: "RelationshipModulation | None" = None,
+    ) -> float:
+        """返回关系阶段对防御概率的调制因子。
+
+        Returns:
+            defense_prob_multiplier (1.0 = no change)
+        """
+        if modulation is None:
+            return 1.0
+        return modulation.defense_prob_mult

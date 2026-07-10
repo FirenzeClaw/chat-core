@@ -571,3 +571,191 @@ class NarrativeState:
     latest: str = ""
     chapters: list[NarrativeEntry] = field(default_factory=list)
     timeline_keys: list[str] = field(default_factory=list)
+
+
+# ── Spec 008: 社交与关系 ─────────────────────────────────────
+
+class RelationshipStage(Enum):
+    """关系阶段判定"""
+    STRANGER = "stranger"
+    ACQUAINTANCE = "acquaintance"
+    FRIEND = "friend"
+    CLOSE_FRIEND = "close_friend"
+
+
+@dataclass
+class RelationshipVector:
+    """4 维关系向量 — per-user"""
+    user_id: str = ""
+    trust: float = 0.0          # 信任：recall 命中 + 深度对话
+    closeness: float = 0.0      # 亲近：turn 数 + 情感共鸣 + 自我暴露
+    respect: float = 0.0        # 尊重：话题质量 + 纠正被接受
+    familiarity: float = 0.0    # 熟悉度：纯统计 (turn 数 + 记忆条目数)
+    last_interaction: float = 0.0  # unix timestamp
+
+
+@dataclass
+class RelationshipModulation:
+    """关系阶段 → 人格调制参数（叠加在 PersonalityEngine 输出上）"""
+    empathy_mult: float = 1.0
+    self_disclosure_mult: float = 1.0
+    defense_prob_mult: float = 1.0
+    proactive_prob_mult: float = 1.0
+
+
+@dataclass
+class GroupRoleMetrics:
+    """群内角色统计（纯统计层，零 LLM 成本）"""
+    group_id: str = ""
+    total_messages: int = 0
+    at_count: int = 0
+    reply_count: int = 0
+    member_reply_to_ai: int = 0
+    active_days: int = 0
+    member_count: int = 0
+
+    @property
+    def at_ratio(self) -> float:
+        return self.at_count / max(self.total_messages, 1)
+
+    @property
+    def engagement_rate(self) -> float:
+        return self.member_reply_to_ai / max(self.reply_count, 1)
+
+    @property
+    def role_score(self) -> float:
+        return min(1.0,
+            self.at_ratio * 10 + self.engagement_rate * 0.5 +
+            min(self.active_days / 30, 0.3))
+
+
+@dataclass
+class GroupAtmosphere:
+    """群氛围快照"""
+    group_id: str = ""
+    avg_emotion: dict[str, float] | None = None  # EmotionState 简化版
+    dominant_topics: list[str] = field(default_factory=list)
+    conflict_events: int = 0
+    last_conflict_turn: int = 0
+    emotional_volatility: float = 0.0
+
+
+@dataclass
+class InteractionPattern:
+    """检测到的交互模式（仪式感/习惯）"""
+    pattern_type: str = ""       # "greeting" | "timing" | "topic_cycle" | "inside_joke"
+    template: str = ""
+    count: int = 0
+    last_seen: str = ""          # ISO8601
+    time_distribution: dict[str, int] = field(default_factory=dict)
+
+
+# ── Spec 009: 认知增强 ─────────────────────────────────────
+
+class IntuitionLevel(Enum):
+    """直觉推理级别"""
+    L1_MEMORY_MATCH = "l1_memory_match"   # 记忆命中 → 直接快速回复
+    L2_FAST_PATH = "l2_fast_path"         # 单次 Flash → 快速回复
+    L3_FULL_REACT = "l3_full_react"       # 完整 ReAct 循环
+
+
+@dataclass
+class IntuitionResult:
+    """直觉引擎评估结果"""
+    level: IntuitionLevel = IntuitionLevel.L3_FULL_REACT
+    fast_reply: str | None = None          # L1/L2 成功时的快速回复文本
+    inner_thoughts: str | None = None      # 对应内心戏
+    confidence: float = 0.0               # L2 置信度
+    skip_react: bool = False              # True = 跳过子Session ReAct
+
+
+@dataclass
+class CreativityContext:
+    """创造力双路径发散结果"""
+    path_a_mappings: list[str] = field(default_factory=list)   # LLM 概念映射
+    path_b_memories: list[str] = field(default_factory=list)    # 远距离关联记忆摘要
+    triggered: bool = False
+
+
+@dataclass
+class HumorOpportunity:
+    """幽默机会"""
+    type: str = ""                        # "expectation_violation" | "pun"
+    expected: str = ""                    # 预期违背: 预期答案
+    word: str = ""                        # 双关语: 歧义词
+    hint: str = ""
+
+
+class MoralConflictType(Enum):
+    """道德冲突类型"""
+    HONESTY_VS_PROTECTION = "honesty_vs_protection"
+    LOYALTY_CONFLICT = "loyalty_conflict"
+    SELF_VS_OTHER = "self_vs_other"
+    NONE = "none"
+
+
+@dataclass
+class MoralConflict:
+    """检测到的道德困境"""
+    conflict_type: MoralConflictType = MoralConflictType.NONE
+    trigger_description: str = ""
+    stakes: float = 0.0                  # 冲突强度 [0, 1]
+
+
+@dataclass
+class ProConAssessment:
+    """双脑道德评估结果"""
+    logic_score: float = 0.0             # LogicBrain: 真相/原则的价值
+    logic_reasoning: str = ""
+    emotion_score: float = 0.0           # EmotionBrain: 关系/感受的价值
+    emotion_reasoning: str = ""
+    deadlock: bool = False               # |diff| < 0.2 → 两难
+    escalation: bool = False             # |diff| > 0.4 → 升级元认知
+    recommended_path: str = ""           # "honest" | "protective" | "deadlock"
+
+
+# ── Spec 011: 沉默语义 + 动机系统 ──────────────────────────
+
+class SilenceType(Enum):
+    """沉默语义分类 (Spec 011)"""
+    HESITANT = "hesitant"
+    TACIT = "tacit"
+    ANGRY = "angry"
+    STRATEGIC = "strategic"
+    OVERLOAD = "overload"
+
+
+@dataclass
+class SilenceRecord:
+    """沉默记录 (Spec 011)"""
+    silence_type: SilenceType = SilenceType.STRATEGIC
+    turn_id: str = ""
+    trigger: str = ""
+    emotion_snapshot: dict[str, float] | None = None
+    reasoning: str = ""
+
+
+@dataclass
+class DriveSignal:
+    """单个驱动信号 (Spec 011)"""
+    name: str = ""               # "socialize" | "rest" | "seek_close" | "clarify" | "vent"
+    strength: float = 0.0        # [0, 1]
+    source: str = ""             # "boredom" | "energy" | "loneliness" | "confusion" | "anger"
+    layer: str = "drive"         # "drive" | "value"
+
+
+@dataclass
+class MotivationState:
+    """当前动机集合 (Spec 011)"""
+    active_drives: list[DriveSignal] = field(default_factory=list)
+    active_values: list[DriveSignal] = field(default_factory=list)
+    conflicts: list[str] = field(default_factory=list)
+    strongest: str = ""          # 最强烈动机 name
+
+
+@dataclass
+class LonelinessState:
+    """孤独状态 (Spec 011)"""
+    level: float = 0.0           # [0, 1]
+    last_tick: float = 0.0       # unix timestamp
+    has_close_relationship: bool = False

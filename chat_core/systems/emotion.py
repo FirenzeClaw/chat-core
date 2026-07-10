@@ -347,6 +347,15 @@ class EmotionEngine:
         if self._vulnerability_enabled:
             self._check_vulnerability()
 
+    def set_relationship_stage(self, stage: str | None) -> None:
+        self._current_relationship_stage = stage
+
+    def _is_relationship_safe(self) -> bool:
+        stage = getattr(self, "_current_relationship_stage", None)
+        if stage is None:
+            return True
+        return stage in ("friend", "close_friend")
+
     def _check_vulnerability(self) -> bool:
         """检测是否处于脆弱状态（任一复合情绪 ≥ 阈值）。
         
@@ -354,6 +363,10 @@ class EmotionEngine:
         触发后设置 cooldown 计数器，冷却期内不重复触发。
         """
         if not self._vulnerability_enabled:
+            return False
+
+        if not self._is_relationship_safe():
+            self.is_vulnerable = False
             return False
 
         if self._vulnerability_cooldown > 0:

@@ -1,5 +1,49 @@
 # Changelog
 
+## [Unreleased] — 2026-07-10 (审计 + 管线修复 + QQ Bot 集成)
+
+### Fixed — 实施完整度审计修复
+
+- **P0 管线断裂修复 (6 项)**: SILENCE 决策路径连接 (turn_manager.py)；PersonalityEngine 关系调制存入 runtime_state；DefenseEngine.evaluate() 传入 relationship_modulation 参数；insight_text 注入 system prompt (loop.py)；ValueEngine.get_modulation("moral_bias") 传入 ProConAssessor.assess() (moral.py)；build_context() 传入 7 个扩展参数 (relationship_stage/group_role_summary/moral_conflict_context/silence_pattern/active_motivations/value_state/narrative_text)
+- **P1 数据桥接修复**: 情感共鸣 ai_emotion_valence 传入 RelationshipEngine.update()
+- **P2 局部修复 (8 项)**: _build_defense_summary + _build_memory_state stub 实现 + _defense_history 追踪；SubjectiveClock.tick() 传入 emotion_state + interest_match；BoredomDetector.get_boredom() 改用 subjective_clock.accumulated；脆弱感 _is_relationship_safe() 关系安全门；metacognition moral_escalation_pending 触发条件 + compound_alert 事件订阅；ANGRY 沉默 resentment +0.05 + memory._time_annotate dragging 分支；silence/motivation/loneliness 编码约定
+- **附带修复**: InterestModel 初始化排序 bug (使用前定义)；SQLite migration ALTER TABLE DEFAULT (unixepoch()) → DEFAULT 0.0
+- 修改文件: turn_manager.py, emotion.py, metacognition.py, moral.py, loop.py, boredom.py, memory.py, silence.py, motivation.py, loneliness.py (10 files)
+- 测试基线: 467 passed, 0 failed
+
+### Added — QQ Bot Spec 子系统集成
+
+- **adapter.py 集成 14 子系统**: Spec 005 DefenseEngine + 脆弱感检测；Spec 010 ValueEngine；Spec 008 RelationshipEngine + PatternDetector + GroupDynamics 补充 (record_reply/record_active_day)；Spec 011 SilenceClassifier + MotivationEngine + LonelinessDetector；Spec 009 IntuitionEngine + CreativityEngine + HumorDetector + MoralConflictDetector + ProConAssessor
+- **集成点**: `__init__` 14 引擎初始化 + runtime_state；`_process` 关系更新/模式检测/脆弱安全门/孤独 tick/动机注入/道德 fire-and-forget；`_async_review_and_decide` 防御判定 + 沉默语义化；`_get_or_create_sub_session` 关系上下文/社交模式/直觉引擎传递
+- **新增辅助方法**: `_run_creativity_dual_path` (Path A Flash LLM + Path B 联锁检索)；`_moral_check` (双脑 Pro/Con + ValueEngine bias + 归档)
+- adapter.py 719→1010 行 (+291)，qq_bot.py 零变更
+- 运行时验证: 所有子系统已确认流转 (rel/pat/sil/mot/lon/cre/hum/mor=on)
+
+### Added — 审计与计划文档
+
+- `docs/superpowers/specs/2026-07-10-spec-completeness-audit.md` — 9 套系统完整度审计报告 (148 FR, 15 缺陷)
+- `docs/superpowers/plans/2026-07-10-spec-completeness-fix.md` — CLI 修复计划 v2 (17 任务, ~180 行)
+- `docs/superpowers/plans/2026-07-10-spec-completeness-fix-review.md` — CLI plan v1 审查 (15 缺陷)
+- `docs/superpowers/plans/2026-07-10-qq-bot-spec-integration.md` — QQ Bot 集成计划 v2 (14 子系统, ~225 行)
+- `docs/superpowers/plans/2026-07-10-qq-bot-spec-integration-review.md` — QQ Bot plan v1 审查 (12 缺陷)
+
+### Changed
+
+- **AGENTS.md**: 设计文档表新增审计报告入口；测试数 466→467；已知问题: DeepSeek API 400 (根因待确认)
+- **IMPLEMENTATION-ROADMAP.md**: §八 新增 CLI 修复完成 + QQ Bot 集成完成 + 已知问题
+- **.env**: 新增 QQ_BOT_APPID / QQ_BOT_SECRET
+
+## [Unreleased] — 2026-07-10 (Phase 3 完成: 社交+认知+沉默 全部落地)
+
+### Added — Phase 3: Spec 008/009/011
+
+- **Spec 008 社交与关系** (Phase 3): RelationshipEngine 4 维关系向量 (trust/closeness/respect/familiarity) + 阶段自动判定 (stranger→acquaintance→friend→close_friend) + 人格调制系数输出 + 基于时间间隔的衰减计算 + Spec 007 联动 (低精力降主动)；GroupDynamics 群角色统计 (at/observe/reply/member_reply/active_day) + 群氛围快照 + MemoryStore 持久化 (global/group/{gid}/atmosphere)；PatternDetector 4 种模式检测 (greeting/timing/topic_cycle/inside_joke) + 中间态跨 session 持久化 (user/{uid}/patterns/_pending) + 达标迁移 (user/{uid}/patterns) + system prompt 注入；PersonalityEngine.apply_relationship_modulation() + DefenseEngine.relationship_modulation 参数；_format_recall_result() 跨群社交注解；build_context() 群角色+关系阶段
+- **Spec 008 集成**: loop.py +4 注入方法 (关系阶段+社交模式)；turn_manager.py +3 引擎初始化 + set_current_user_id() + _run_sub_session 注入 + _async_review_and_decide 更新管线；defense.py +relationship_modulation 参数；memory.py +跨群注解；metacognition.py +context 参数；adapter.py +GroupDynamics；config.yaml +3 配置段；43 新增测试 (22+12+9)
+- **Spec 009 认知增强** (Phase 3): IntuitionEngine 三级降级推理 (L1 记忆匹配→零LLM快速回复, L2 Fast Path→单次Flash调用, L3 完整ReAct兜底) + 注意力/精力状态调制；CreativityEngine 双路径概念发散 (Path A Flash LLM概念跳跃 + Path B Spec 003 联锁放大) + 合并注入 system prompt；HumorDetector 纯规则幽默检测 (预期违背+双关语+关系安全门)；MoralConflictDetector 三种冲突检测 (honesty_vs_protection/loyalty_conflict/self_vs_other) + ProConAssessor 双脑评估 (deadlock<0.2/escalation>0.4) + LogicBrain/EmotionBrain.pro_con()
+- **Spec 009 集成**: loop.py run() 直觉判定 (L1 skip→early return) + _inject_creativity_context()/_inject_humor_hint() + L2 Fast Path _think() 分支 (Flash→置信度门控→send_reply/回落L3)；turn_manager.py 创造力触发 (Path A Flash+Path B search_chained) + 道德困境检测→双脑Pro/Con→归档 (self/moral/)→escalation→metacognition标记 + deadlock→subconscious写入；metacognition.py moral_escalation_pending；52 新增测试 (10+12+12+19)
+- **Spec 011 沉默语义+动机** (Phase 3): SilenceClassifier 5 类沉默语义判定 (OVERLOAD→ANGRY→TACIT→HESITANT→STRATEGIC 优先级链) + 差异化 silence 增量 (TACIT/OVERLOAD=0) + OVERLOAD 恢复加速 (boost_recovery×2.0)；MotivationEngine 双层架构 (Drive Reduction: socialize/rest/seek_close/clarify/vent + Value Pursuit: explore/check_on/confront/reflect) + 冲突解决 (rest>explore 优先)；LonelinessDetector 指数衰减模型 (半衰期1200s主观时间) + 亲近关系依赖 (无 close→loneliness=0) + SubjectiveClock 调制
+- **Spec 011 集成**: turn_manager.py _silent_archive() 追加 SilenceClassifier 语义判定 + OVERLOAD boost_recovery + self/silences 归档 + narrative silence_streak 事件；_run_sub_session 注入动机 hint；_async_review_and_decide 末尾追加孤独+动机评估→subconscious/motivations 写入；loop.py _init_messages 动机注入；proactive.py set_motivation_engine + rest→return 阻断；metacognition.py silence+motivation 上下文参数；EnergyBar.boost_recovery()；92 新增测试 (44+48)
+
 ## [Unreleased] — 2026-07-10 (Phase 1+2: 注意力 + 幂律 + 复合情绪 + 具身感知)
 
 ### Added

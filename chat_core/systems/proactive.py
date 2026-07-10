@@ -65,6 +65,9 @@ class ProactiveSystem:
         self._reply_callback = reply_callback
         self._stream_callback = stream_callback
 
+        # Spec 011: 动机引擎（可选注入，无引擎时回退旧逻辑）
+        self._motivation_engine: Any = None
+
         # 主动子Session 状态
         self._proactive_loop: ReActLoop | None = None
         self._proactive_active: bool = False
@@ -79,6 +82,10 @@ class ProactiveSystem:
     @property
     def proactive_loop(self) -> ReActLoop | None:
         return self._proactive_loop
+
+    def set_motivation_engine(self, engine: Any) -> None:
+        """Spec 011: 注入动机引擎（可选，无引擎时回退旧无聊驱动逻辑）"""
+        self._motivation_engine = engine
 
     # ── Phase 7: 话题提取 ───────────────────────────────────
 
@@ -131,6 +138,20 @@ class ProactiveSystem:
 
         DULL 态特殊处理：不发起对话，仅写入 subconscious/nudges。
         """
+        # Spec 011: 动机检查 — rest → 不主动发起
+        if self._motivation_engine and self._motivation_engine.enabled:
+            try:
+                m_entries = await self._memory.query("subconscious/motivations")
+                for m_entry in m_entries:
+                    if m_entry.key == "current" and isinstance(m_entry.value, dict):
+                        state_dict = m_entry.value.get("state")
+                        if isinstance(state_dict, dict) and state_dict.get("strongest"):
+                            if state_dict["strongest"] == "rest":
+                                return  # 需要休息，不主动发起
+                        break
+            except Exception:
+                pass  # 静默降级
+
         # DULL 态 + 无聊 → 不发起对话，写 nudges 等恢复后处理
         if self._attention_model is not None:
             try:

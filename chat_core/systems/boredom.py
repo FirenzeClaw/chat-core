@@ -34,7 +34,8 @@ class BoredomDetector:
     END_CONVERSATION_THRESHOLD = 0.90  # 结束对话阈值
 
     def __init__(self, attention_model: Any = None, subjective_clock: Any = None,
-                 energy_bar: Any = None) -> None:
+                 energy_bar: Any = None, emotion_engine: Any = None,
+                 interest_model: Any = None) -> None:
         self._eval_param: float = 0.0
         self._interest_weight: float = 0.0
         self._start_time: float = 0.0
@@ -47,6 +48,8 @@ class BoredomDetector:
         # Spec 007: 主观时钟 + 精力条（可选，向后兼容）
         self._subjective_clock = subjective_clock
         self._energy_bar = energy_bar
+        self._emotion_engine = emotion_engine
+        self._interest_model = interest_model
 
         # 后台 tick 控制
         self._task: asyncio.Task[None] | None = None
@@ -113,7 +116,10 @@ class BoredomDetector:
         """
         if not self._active:
             return 0.0
-        elapsed = time.time() - self._start_time
+        if self._subjective_clock and self._subjective_clock.accumulated > 0:
+            elapsed = self._subjective_clock.accumulated
+        else:
+            elapsed = time.time() - self._start_time
         if elapsed <= 0:
             return 1.0 - self._eval_param
         decay = math.exp(-elapsed / self.DEFAULT_DECAY_HALFLIFE)
@@ -176,7 +182,17 @@ class BoredomDetector:
             if self._subjective_clock and self._attention_model:
                 try:
                     attn_state = self._attention_model.get_state_enum("sub")
-                    self._subjective_clock.tick(interval, attention_state_enum=attn_state)
+                    emotion_state = (
+                        self._emotion_engine.get_state("sub")
+                        if self._emotion_engine else None
+                    )
+                    interest_match = 0.0
+                    self._subjective_clock.tick(
+                        interval,
+                        attention_state_enum=attn_state,
+                        emotion_state=emotion_state,
+                        interest_match=interest_match,
+                    )
                 except Exception:
                     pass  # 静默降级
             if self._energy_bar:

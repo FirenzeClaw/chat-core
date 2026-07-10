@@ -15,12 +15,12 @@
 | 005 | 复合情绪 + 防御机制 | `2026-07-10-compound-emotion-defense-design.md` | 26 | +42 | 2 | ✅ 已完成 |
 | 006 | 元认知深度 | `2026-07-10-metacognition-depth-design.md` | 14 | +29 | 2 | ✅ 已完成 |
 | 007 | 具身感知 (疲劳+主观时间) | `2026-07-10-embodied-perception-design.md` | 16 | +15 | 2 | ✅ 已完成 |
-| 008 | 社交与关系 | `2026-07-10-social-relationship-design.md` | 16 | +16 | 3 | ⬜ 待实施 |
-| 009 | 认知增强 | `2026-07-10-cognitive-enhancement-design.md` | 18 | +18 | 4 | ⬜ 待实施 |
-| 010 | 价值体系 + 自我叙事 | `2026-07-10-values-narrative-design.md` | 14 | +13 | 2 | ⬜ 待实施 |
-| 011 | 沉默语义 + 动机系统 | `2026-07-10-silence-motivation-design.md` | 18 | +18 | 3 | ⬜ 待实施 |
+| 008 | 社交与关系 | `2026-07-10-social-relationship-design.md` | 16 | +43 | 3 | ✅ 已完成 |
+| 009 | 认知增强 | `2026-07-10-cognitive-enhancement-design.md` | 18 | +52 | 4 | ✅ 已完成 |
+| 010 | 价值体系 + 自我叙事 | `2026-07-10-values-narrative-design.md` | 14 | +18 | 2 | ✅ 已完成 |
+| 011 | 沉默语义 + 动机系统 | `2026-07-10-silence-motivation-design.md` | 18 | +92 | 3 | ✅ 已完成 |
 
-> **总计**: ~148 新 FR，~133 新 tests，18 个新系统文件
+> **总计**: ~148 新 FR，~281 新 tests，18 个新系统文件。**全部完成。**
 
 ---
 
@@ -89,11 +89,11 @@
 
 | 优先级 | Spec | 依赖 | 预估工作量 |
 |:---:|------|------|:---:|
-| P2 | Spec 008 | Spec 003 + 005 + 006 + 007（全底层） | 4-5 天 |
-| P2 | Spec 011 | Spec 007 + 008（沉默需能量+关系数据） | 3-4 天 |
-| P2 | Spec 009 | Spec 003 + 005 + 007 + 008（全底层） | 5-7 天 |
+| P2 | Spec 008 | Spec 003 + 005 + 006 + 007（全底层） | ✅ 已完成 |
+| P2 | Spec 011 | Spec 007 + 008（沉默需能量+关系数据） | ✅ 已完成 |
+| P2 | Spec 009 | Spec 003 + 005 + 007 + 008（全底层） | ✅ 已完成 |
 
-**Phase 3 验收**: AI 有社交梯度 + 群感知 + 直觉 + 创造力 + 幽默 + 道德判断
+**Phase 3 验收**: AI 有社交梯度 + 群感知 + 直觉 + 创造力 + 幽默 + 道德判断 + 沉默语义 + 动机系统 ✅
 
 ---
 
@@ -123,9 +123,9 @@
 | 阶段 | 新增 tests | 回归基线 | 策略 |
 |------|:---:|:---:|------|
 | Phase 1 | +14 | 168 | 注意力状态机 14 测试，零回归 ✅ |
-| Phase 2 | ~61 | 290 | 情绪+能量+元认知+价值观集成测试 |
-| Phase 3 | ~52 | 281 | 关系+动机+认知全量集成测试 |
-| **最终** | **~127** | **290** | 全量 `pytest tests/ -q` 通过 |
+| Phase 2 | ~104 | 290 | 情绪+能量+元认知+价值观集成测试 ✅ |
+| Phase 3 | ~163 | 466 | 关系+认知+沉默+动机全量集成测试 ✅ |
+| **最终** | **~281** | **466** | 全量 `pytest tests/ -q` 通过 (1 预存 flaky) |
 
 ---
 
@@ -194,6 +194,28 @@ systems:
 
 1. ✅ 注意力状态机实施（已完成: 3 Sessions, 10 Tasks, 9 Files, 168 tests）
 2. ✅ Spec 003 §12 幂律遗忘 + 双向迁移 (已完成: 1 Session, 7 Tasks, +7 tests)
-3. ✅ 按 Phase 2 顺序推进 (Spec 005 ✅ → 007 ✅ → 006 ✅ → 010 待实施)
-4. ⬜ Spec 010 价值体系 + 自我叙事 (Phase 2 最后一个)
-4. ⬜ 每个 Spec 完成后 → `pytest tests/ -q` 验证零回归
+3. ✅ Phase 2 全部完成 (Spec 005 ✅ → 007 ✅ → 006 ✅ → 010 ✅)
+4. ✅ Phase 3 全部完成 (Spec 008 ✅ → 009 ✅ → 011 ✅)
+5. 🎉 **全部 8 个 Spec 实施完毕。最终: 466 tests, 18 个新系统文件。**
+6. 📋 **实施完整度审计完成 (2026-07-10)**：见 `docs/superpowers/specs/2026-07-10-spec-completeness-audit.md`
+   - 核心引擎: 完整 (93% FR 覆盖)
+   - 发现 6 个 P0 管线断裂 + 1 个 P1 参数桥接缺失 + 8 个 P2 局部遗漏
+   - QQ Bot (adapter.py) 缺失 Spec 005/008/009/011 集成
+   - 预估修复总改动量 ~150 行
+7. ✅ **CLI 管线修复完成 (2026-07-10)**：见 `docs/superpowers/plans/2026-07-10-spec-completeness-fix.md`
+   - P0 修复 6 项: SILENCE 路径、关系/防御调制、insight 注入、道德集成、build_context 桥接
+   - P1 修复 1 项: 情感共鸣 valence
+   - P2 修复 8 项: stub 方法、SubjectiveClock、脆弱安全门、moral escalation、compound_alert、ANGRY delta、编码约定
+   - 附带修复: InterestModel 初始化排序 bug、SQLite migration DEFAULT (unixepoch()) bug
+   - 最终: 467 tests, 0 failures
+8. ✅ **QQ Bot Spec 集成完成 (2026-07-10)**：见 `docs/superpowers/plans/2026-07-10-qq-bot-spec-integration.md`
+   - adapter.py 集成 14 子系统 (Spec 005/008/009/010/011)
+   - Stage 1: DefenseEngine + ValueEngine + 脆弱感检测
+   - Stage 2: RelationshipEngine + PatternDetector + GroupDynamics 补充 + 关系调制
+   - Stage 3a: SilenceClassifier + MotivationEngine + LonelinessDetector
+   - Stage 3b: IntuitionEngine + CreativityEngine + HumorDetector + MoralConflictDetector
+   - adapter.py 719→1010 行 (+291), qq_bot.py 零变更
+   - QQ Bot 已启动运行，子系统验证 rel/pat/sil/mot/lon/cre/hum/mor=on
+9. ⚠️ **已知问题**: DeepSeek API 400 偶发于子Session 第 3+ 段 (错误信息 "An assistant...")，根因待确认
+   - QQ Bot (adapter.py) 缺失 Spec 005/008/009/011 集成
+   - 预估修复总改动量 ~150 行

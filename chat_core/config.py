@@ -220,6 +220,46 @@ class Config:
         """返回 systems.narrative 配置 (Spec 010)"""
         return self.systems.get("narrative", {})
 
+    def relationship_config(self) -> dict[str, Any]:
+        """返回 systems.relationship 配置 (Spec 008)"""
+        return self.systems.get("relationship", {})
+
+    def group_dynamics_config(self) -> dict[str, Any]:
+        """返回 systems.group_dynamics 配置 (Spec 008)"""
+        return self.systems.get("group_dynamics", {})
+
+    def patterns_config(self) -> dict[str, Any]:
+        """返回 systems.patterns 配置 (Spec 008)"""
+        return self.systems.get("patterns", {})
+
+    def intuition_config(self) -> dict[str, Any]:
+        """返回 systems.intuition 配置 (Spec 009)"""
+        return self.systems.get("intuition", {})
+
+    def creativity_config(self) -> dict[str, Any]:
+        """返回 systems.creativity 配置 (Spec 009)"""
+        return self.systems.get("creativity", {})
+
+    def humor_config(self) -> dict[str, Any]:
+        """返回 systems.humor 配置 (Spec 009)"""
+        return self.systems.get("humor", {})
+
+    def moral_conflict_config(self) -> dict[str, Any]:
+        """返回 systems.moral_conflict 配置 (Spec 009)"""
+        return self.systems.get("moral_conflict", {})
+
+    def silence_semantics_config(self) -> dict[str, Any]:
+        """返回 systems.silence_semantics 配置 (Spec 011)"""
+        return self.systems.get("silence_semantics", {})
+
+    def motivations_config(self) -> dict[str, Any]:
+        """返回 systems.motivations 配置 (Spec 011)"""
+        return self.systems.get("motivations", {})
+
+    def loneliness_config(self) -> dict[str, Any]:
+        """返回 systems.loneliness 配置 (Spec 011)"""
+        return self.systems.get("loneliness", {})
+
     def qq_config(self) -> dict[str, Any]:
         return self._data.get("qq_bot", {})
 

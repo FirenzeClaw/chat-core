@@ -13,6 +13,7 @@
 - **入口**: `chat_core/cli.py` → `chat-core` 命令（CLI 模式），`chat_core/qq_bot.py` → `chat-core-qq` 命令（QQ Bot 模式）
 - **定位**: 本地单用户 CLI + QQ 多用户 Bot，零外部编排依赖
 - **模型**: DeepSeek V4 (Pro 主脑 + Flash 子Session)，reasoning_effort 与 function calling 互斥（子Session 用纯文本兜底方案兼容）
+- **已知问题 (2026-07-10)**: QQ Bot 子Session 第 3+ 段回复时偶发 DeepSeek API 400。现象: 前 2 段 200 OK，第 3 段 `400 Bad Request`，错误信息截断于 `"An assistant...`。`loop.py:611` 将 `[系统错误: {e}]` 推入 replies 并作为 QQ 消息发送给用户。Turn 正常结束不阻断。根因待确认。
 
 ---
 
@@ -124,6 +125,16 @@ QQ Bot 模式下：
 | `energy.py` | 精力管理 (消耗+恢复+防御联动) | `EnergyBar` |
 | `subjective_time.py` | 主观时间感知 (注意力/情绪/兴趣三维调制) | `SubjectiveClock` |
 | `metacognition.py` | 元认知深度 (Spec 006): 定期+异常双触发审视、上下文组装、双输出 (insight_text + param_overrides) | `MetacognitionEngine` |
+| `relationship.py` | 关系梯度 + 阶段判定 + 人格调制 (Spec 008) | `RelationshipEngine` |
+| `group_dynamics.py` | 群角色统计 + 氛围快照 (Spec 008) | `GroupDynamics` |
+| `patterns.py` | 仪式感/习惯模式检测 + 中间态持久化 (Spec 008) | `PatternDetector` |
+| `intuition.py` | 三级降级推理 L1/L2/L3 + 状态调制 (Spec 009) | `IntuitionEngine` |
+| `creativity.py` | 双路径概念发散 Path A/B + 合并注入 (Spec 009) | `CreativityEngine` |
+| `humor.py` | 预期违背+双关语+关系安全门 (Spec 009) | `HumorDetector` |
+| `moral.py` | 道德困境检测 + 双脑 Pro/Con 评估 (Spec 009) | `MoralConflictDetector`, `ProConAssessor` |
+| `silence.py` | 5类沉默语义判定 OVERLOAD/ANGRY/TACIT/HESITANT/STRATEGIC (Spec 011) | `SilenceClassifier` |
+| `motivation.py` | 双层动机 Drive Reduction + Value Pursuit + 冲突解决 (Spec 011) | `MotivationEngine` |
+| `loneliness.py` | 孤独驱动维度 + 主观时钟 + 关系依赖 (Spec 011) | `LonelinessDetector` |
 
 ---
 
@@ -242,13 +253,21 @@ LLM 返回 NonStreamResult {content, tool_calls}
 | 元认知周期 | 每 5 轮定期审视 | config.yaml systems.metacognition.periodic_interval |
 | 元认知信心阈值 | 0.6 (低于此只写文本不调参) | config.yaml systems.metacognition.confidence_threshold |
 | 参数覆盖过期 | 5 轮后自动恢复 | config.yaml systems.metacognition.override_expiry_turns |
+| 关系衰减 | trust 0.001/day, closeness 0.003/day | config.yaml systems.relationship.dimensions.*.decay_rate |
+| 关系调制 | stranger empathy ×0.7, close_friend defense_prob ×0.5 | config.yaml systems.relationship.personality_modulation |
+| 直觉 L2 Flash 模型 | deepseek-v4-flash, reasoning_effort=low | config.yaml systems.intuition.level2 |
+| 创造力触发 | playfulness > 0.5 | config.yaml systems.creativity.trigger_playfulness_min |
+| 幽默安全门 | min_relationship_stage: friend | config.yaml systems.humor.min_relationship_stage |
+| 道德 deadlock 阈值 | \|diff\| < 0.2 | config.yaml systems.moral_conflict.pro_con.deadlock_threshold |
+| 沉默 OVERLOAD 恢复加速 | 2.0× | config.yaml systems.silence_semantics.types.overload.recovery_boost |
+| 孤独半衰期 | 1200s 主观时间 | config.yaml systems.loneliness.decay_halflife |
 
 ---
 
 ## 测试
 
 ```bash
-# 单元测试 (261 tests)
+# 单元测试 (467 tests)
 python -m pytest tests/ -v
 
 # Spec E2E 测试 (19 scenarios)
@@ -273,9 +292,20 @@ python -m pytest tests/ --cov=chat_core --cov-report=term
 | `tests/test_design_alignment.py` | 审查异步/subconscious注入/递归深度/权重/拧巴/降级/情绪通道 |
 | `tests/test_compound_emotion.py` | 复合情绪: INTERACTION_MATRIX + 衰减 + 传染 + alert + 脆弱检测 (28 tests) |
 | `tests/test_defense.py` | 防御引擎: DENIAL/RATIONALIZE/PROJECT + 脆弱联动 (7 tests) |
-| `tests/test_energy.py` | EnergyBar: consume/recover/exit/防御联动 (9 tests) |
+| `tests/test_energy.py` | EnergyBar: consume/recover/exit/防御联动 + boost_recovery (9+ tests) |
 | `tests/test_subjective_time.py` | SubjectiveClock: speed_factor/boredom联动/记忆标记 (6 tests) |
 | `tests/test_metacognition.py` | MetacognitionEngine: 触发判定/上下文组装/参数覆盖/confidence门控/过期 (29 tests) |
+| `tests/test_values.py` | ValueEngine: 三层树加载/动态调权/调制因子 (Spec 010) |
+| `tests/test_narrative.py` | NarrativeEngine: 事件增量/章节追加/latest生成 (Spec 010) |
+| `tests/test_relationship.py` | RelationshipEngine: 4维向量/阶段判定/衰减/人格调制/低精力联动 (22 tests, Spec 008) |
+| `tests/test_group_dynamics.py` | GroupDynamics: 群角色统计/氛围快照/跨群注解 (12 tests, Spec 008) |
+| `tests/test_patterns.py` | PatternDetector: 问候/时间规律/内部梗/系统注入 (9 tests, Spec 008) |
+| `tests/test_intuition.py` | IntuitionEngine: 三级降级/状态调制/L2 Fast Path 完整链路 (10 tests, Spec 009) |
+| `tests/test_creativity.py` | CreativityEngine: 双路径发散/触发判定/合并注入 (12 tests, Spec 009) |
+| `tests/test_humor.py` | HumorDetector: 预期违背/双关语/关系安全门 (12 tests, Spec 009) |
+| `tests/test_moral.py` | MoralConflict/ProCon: 三类型检测/双脑评估/deadlock/escalation (19 tests, Spec 009) |
+| `tests/test_silence.py` | SilenceClassifier: 5类判定/行为差异/优先级链 (44 tests, Spec 011) |
+| `tests/test_motivation.py` | MotivationEngine+LonelinessDetector: 驱动/价值/冲突/孤独 (48 tests, Spec 011) |
 | `tests/spec_e2e_test.py` | 全量 Spec 19 场景 (需要 API key) |
 
 ---
@@ -345,10 +375,18 @@ python -m pytest tests/ --cov=chat_core --cov-report=term
 | 文档 | 路径 |
 |------|------|
 | 原始架构设计 (v2) | `chat-core-design.md` |
+| 实施路线图 | `docs/superpowers/specs/IMPLEMENTATION-ROADMAP.md` |
 | 注意力状态机设计 | `docs/superpowers/specs/2026-07-10-attention-state-machine-design.md` |
 | 注意力状态机实施计划 | `docs/superpowers/plans/2026-07-10-attention-state-machine.md` |
 | 记忆联锁设计 | `docs/superpowers/specs/2026-07-10-memory-chain-recall-design.md` |
 | 幂律遗忘实施计划 | `docs/superpowers/plans/2026-07-10-memory-power-law-decay.md` |
 | 复合情绪实施计划 | `docs/superpowers/plans/2026-07-10-compound-emotion-defense.md` |
 | 具身感知实施计划 | `docs/superpowers/plans/2026-07-10-embodied-perception.md` |
+| 社交与关系设计 | `docs/superpowers/specs/2026-07-10-social-relationship-design.md` |
+| 社交与关系实施计划 | `docs/superpowers/plans/2026-07-10-social-relationship.md` |
+| 认知增强设计 | `docs/superpowers/specs/2026-07-10-cognitive-enhancement-design.md` |
+| 认知增强实施计划 | `docs/superpowers/plans/2026-07-10-cognitive-enhancement.md` |
+| 沉默语义+动机设计 | `docs/superpowers/specs/2026-07-10-silence-motivation-design.md` |
+| 沉默语义+动机实施计划 | `docs/superpowers/plans/2026-07-10-silence-motivation.md` |
 | Agent 状态机模式分析 | `chat-cli-research.md` §Agent 状态机核心模式 |
+| Spec 实施完整度审计 (2026-07-10) | `docs/superpowers/specs/2026-07-10-spec-completeness-audit.md` |

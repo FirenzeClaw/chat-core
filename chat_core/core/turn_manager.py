@@ -27,6 +27,7 @@ from chat_core.core.types import (
     MetaParamOverrides,
     ReplySegment,
     ReviewResult,
+    SilenceType,
     TurnStatus,
 )
 from chat_core.systems.memory import MemoryStore
@@ -43,6 +44,15 @@ from chat_core.systems.values import ValueEngine  # Spec 010
 from chat_core.systems.narrative import NarrativeEngine  # Spec 010
 from chat_core.systems.subjective_time import SubjectiveClock
 from chat_core.systems.proactive import ProactiveSystem, _enhance_recall
+from chat_core.systems.relationship import RelationshipEngine  # Spec 008
+from chat_core.systems.group_dynamics import GroupDynamics  # Spec 008
+from chat_core.systems.patterns import PatternDetector  # Spec 008
+from chat_core.systems.creativity import CreativityEngine  # Spec 009
+from chat_core.systems.humor import HumorDetector  # Spec 009
+from chat_core.systems.moral import MoralConflictDetector, ProConAssessor  # Spec 009
+from chat_core.systems.silence import SilenceClassifier  # Spec 011
+from chat_core.systems.motivation import MotivationEngine  # Spec 011
+from chat_core.systems.loneliness import LonelinessDetector  # Spec 011
 
 import logging
 
@@ -105,6 +115,7 @@ class TurnManager:
 
         # Spec 005: 防御机制
         self._defense_engine = DefenseEngine()
+        self._defense_history: list[str] = []
         self._error_history: dict[str, int] = {}
 
         # Spec 007: 具身感知 — 精力条 + 主观时钟
@@ -129,15 +140,37 @@ class TurnManager:
         self._value_engine = ValueEngine() if vc_cfg.get("enabled", True) else None
         self._narrative_engine = NarrativeEngine() if nc_cfg.get("enabled", True) else None
 
-        self._boredom_detector = BoredomDetector(
-            attention_model=attention_model,
-            subjective_clock=self._subjective_clock,
-            energy_bar=self._energy_bar,
-        )
+        # Spec 008: 社交与关系
+        self._relationship_engine = RelationshipEngine()
+        self._group_dynamics = GroupDynamics()
+        self._group_dynamics.set_memory(memory)  # 注入 MemoryStore 供氛围持久化
+        self._pattern_detector = PatternDetector()
+        self._pattern_detector.set_memory(memory)  # 注入 MemoryStore 供中间态持久化
+        self._current_user_id: str = "default"  # CLI 默认，QQ 模式由 adapter 覆写
+
+        # Spec 009: 认知增强
+        self._creativity_engine = CreativityEngine()
+        self._humor_detector = HumorDetector()
+        self._moral_conflict_detector = MoralConflictDetector()
+        self._pro_con_assessor = ProConAssessor()
+
+        # Spec 011: 沉默语义 + 动机系统
+        self._silence_classifier = SilenceClassifier()
+        self._motivation_engine = MotivationEngine()
+        self._loneliness_detector = LonelinessDetector()
+
         self._interest_model = InterestModel(
             topic_trigger_threshold=int(ic.get("topic_trigger_threshold", 3)),
             topic_weight_increment=float(ic.get("topic_weight_increment", 0.1)),
             decay_per_hour=float(ic.get("decay_per_hour", 0.05)),
+        )
+
+        self._boredom_detector = BoredomDetector(
+            attention_model=attention_model,
+            subjective_clock=self._subjective_clock,
+            energy_bar=self._energy_bar,
+            emotion_engine=self._emotion_engine,
+            interest_model=self._interest_model,
         )
 
         self._proactive = ProactiveSystem(
@@ -158,6 +191,9 @@ class TurnManager:
         self._boredom_detector.set_on_trigger(self._proactive._on_boredom_trigger)
         self._boredom_detector.set_on_end_conversation(self._proactive._on_end_conversation_signal)
 
+        # Spec 011: 注入动机引擎到主动系统
+        self._proactive.set_motivation_engine(self._motivation_engine)
+
         # 流式回调（由 CLI 注入）
         self._stream_callback: Any = None
         self._reply_callback: Any = None
@@ -177,6 +213,10 @@ class TurnManager:
         """设置 send_reply 回调（传递给子Session）"""
         self._reply_callback = cb
 
+    def set_current_user_id(self, user_id: str) -> None:
+        """设置当前 turn 的用户 ID（CLI 调用前设置 "default"，QQ adapter 设置 openid）"""
+        self._current_user_id = user_id
+
     # ── 注意力事件监听（延迟启动）────────────────────────────
 
     def _ensure_listeners(self) -> None:
@@ -186,6 +226,7 @@ class TurnManager:
         self._listeners_started = True
         if self._attention_model:
             asyncio.create_task(self._listen_emotion_alerts())
+            asyncio.create_task(self._listen_compound_alerts())
 
     async def _listen_emotion_alerts(self) -> None:
         """监听 emotion_alert + logic_conflict → AttentionModel.apply_event()"""
@@ -209,6 +250,22 @@ class TurnManager:
 
         # 并行监听两个事件
         await asyncio.gather(_handle_alert(), _handle_conflict())
+
+    async def _listen_compound_alerts(self) -> None:
+        """监听 compound_alert → AttentionModel.apply_event()"""
+        compound_q = self._event_bus.subscribe("compound_alert")
+        while True:
+            data = await compound_q.get()
+            if self._attention_model:
+                self._attention_model.apply_event(
+                    "sub", AttentionEvent.EMOTION_SHOCK, boost=0.30,
+                )
+
+    async def _on_compound_alert(self, event: dict[str, Any]) -> None:
+        if self._attention_model:
+            self._attention_model.apply_event(
+                "sub", AttentionEvent.EMOTION_SHOCK, boost=0.30,
+            )
 
     # ── 主流程 ──────────────────────────────────────────────
 
@@ -261,6 +318,14 @@ class TurnManager:
 
             # 3. 子Session ReAct
             turn.status = TurnStatus.SUB_SESSION
+            # Spec 008: 应用关系阶段人格调制
+            if self._personality_engine and self._relationship_engine:
+                stage = self._relationship_engine.get_stage(self._current_user_id)
+                modulation = self._relationship_engine.get_modulation(self._current_user_id)
+                mod_params = self._personality_engine.apply_relationship_modulation(
+                    stage=stage, modulation=modulation
+                )
+                self.runtime_state["relationship_modulation"] = mod_params
             replies, inner_thoughts = await self._run_sub_session(
                 user_message, merged_context, merged_direction, logic_memories + emotion_memories
             )
@@ -492,6 +557,65 @@ class TurnManager:
         # 增强 recall 工具 — 连接真实记忆存储
         _enhance_recall(tools, self._memory, self._personality_engine)
 
+        # Spec 008: 注入关系阶段 + 社交模式
+        user_id = self._current_user_id
+        stage = self._relationship_engine.get_stage(user_id)
+        description = self._relationship_engine.get_stage_description(stage)
+        loop.set_relationship_context(user_id, stage.value, description)
+
+        patterns_hint = self._pattern_detector.get_pattern_injection(user_id)
+        if patterns_hint:
+            loop.set_social_patterns(patterns_hint)
+
+        # Spec 009: 创造力发散 + 幽默检测
+        if self._creativity_engine.should_trigger(
+            playfulness=self._personality_engine.weights.playfulness if self._personality_engine else 0.3,
+            user_message=user_message,
+        ):
+            loop.set_creativity_engine(self._creativity_engine)
+            # Path A: Flash LLM 概念发散
+            path_a_mappings: list[str] = []
+            path_b_summaries: list[str] = []
+            try:
+                pa_prompt = self._creativity_engine.build_path_a_prompt(user_message)
+                pa_result = await self._provider.chat(
+                    messages=[{"role": "user", "content": pa_prompt}],
+                    temperature=0.8, max_tokens=256,
+                )
+                path_a_mappings = self._creativity_engine.parse_path_a_result(
+                    pa_result.content if hasattr(pa_result, 'content') else str(pa_result)
+                )
+            except Exception:
+                pass
+            # Path B: 联锁放大
+            try:
+                extended_config = self._creativity_engine.get_extended_chain_config()
+                pb_results = await self._memory.search_chained(user_message, extended_config)
+                path_b_summaries = self._creativity_engine.filter_path_b_memories(pb_results)
+            except Exception:
+                pass
+            injection = self._creativity_engine.build_injection(path_a_mappings, path_b_summaries)
+            if injection:
+                loop.set_creativity_context(injection)
+
+        humor_ops = self._humor_detector.detect(user_message, stage)
+        if humor_ops:
+            hint = self._humor_detector.build_injection(humor_ops)
+            if hint:
+                loop.set_humor_hint(hint)
+
+        # Spec 011: 动机注入 — 从 subconscious/motivations 读取当前动机
+        try:
+            m_entries = await self._memory.query("subconscious/motivations")
+            for m_entry in m_entries:
+                if m_entry.key == "current" and isinstance(m_entry.value, dict):
+                    hint_text = m_entry.value.get("hint")
+                    if hint_text:
+                        loop.set_motivation_hint(hint_text)
+                    break
+        except Exception:
+            pass  # 静默降级，动机注入失败不影响子Session
+
         await loop.run(user_message)
         return loop.replies, loop.inner_thoughts
 
@@ -567,6 +691,10 @@ class TurnManager:
                     meta_overrides=self._meta_overrides,  # Spec 006
                     turn_counter=self._turn_counter,
                     value_engine=self._value_engine,  # Spec 010
+                    relationship_modulation=(
+                        self._relationship_engine.get_modulation(self._current_user_id)
+                        if self._relationship_engine else None
+                    ),
                 )
                 if defense.defense_type != DefenseType.DIRECT:
                     await self._apply_defense(defense, review, replies)
@@ -576,6 +704,9 @@ class TurnManager:
                 await self._issue_correction(review, replies)
             elif review.decision == DecisionType.TWISTED:
                 await self._issue_correction(review, replies)
+            elif review.decision == DecisionType.SILENCE:
+                await self._silent_archive(review, replies)
+            if review.decision == DecisionType.TWISTED:
                 # T006: 拧巴记录 — logic overrides emotion
                 turn_id = (
                     self._current_turn.turn_id
@@ -640,6 +771,53 @@ class TurnManager:
                         "cooldown_remaining": getattr(self._emotion_engine, "_vulnerability_cooldown", 0),
                     }
 
+                # ── Spec 008/009/010/011: 扩展上下文 ──
+                if self._relationship_engine:
+                    stage_enum = self._relationship_engine.get_stage(self._current_user_id)
+                    rel_stage = stage_enum.value if stage_enum else None
+                else:
+                    rel_stage = None
+
+                if self._group_dynamics:
+                    metrics = self._group_dynamics.get_metrics(self._current_user_id)
+                    group_summary = vars(metrics) if metrics else None
+                else:
+                    group_summary = None
+
+                moral_ctx = None
+                if getattr(self._metacognition, "moral_escalation_pending", False):
+                    moral_ctx = "道德冲突已升级到元认知审查"
+
+                silence_pattern = None
+                silence_total = sum(self._silence_counters.values())
+                if silence_total > 0:
+                    silence_pattern = f"连续沉默{silence_total}次"
+
+                active_motivations = None
+                if self._motivation_engine:
+                    ms = self._motivation_engine.evaluate(
+                        boredom=self._boredom_detector.get_boredom(),
+                        energy=self._energy_bar._state.energy,
+                        loneliness=(
+                            self._loneliness_detector.current
+                            if self._loneliness_detector else 0.0
+                        ),
+                        value_weights=(
+                            vars(self._value_engine.values)
+                            if self._value_engine else None
+                        ),
+                    )
+                    active_motivations = self._motivation_engine.build_injection(ms)
+
+                value_state = (
+                    vars(self._value_engine.values)
+                    if self._value_engine else None
+                )
+                narrative_text = (
+                    self._narrative_engine.state.latest
+                    if self._narrative_engine else None
+                )
+
                 context = self._metacognition.build_context(
                     turn_summaries=turn_summaries,
                     compound_trends=compound_trends,
@@ -649,6 +827,13 @@ class TurnManager:
                     energy_state=energy_dict,
                     subjective_time=stp_dict,
                     vulnerability_history=vuln_history,
+                    value_state=value_state,
+                    narrative_text=narrative_text,
+                    relationship_stage=rel_stage,
+                    group_role_summary=group_summary,
+                    moral_conflict_context=moral_ctx,
+                    silence_pattern=silence_pattern,
+                    active_motivations=active_motivations,
                 )
 
                 report = await self.logic.metacognition_pass(context)
@@ -664,6 +849,13 @@ class TurnManager:
                             "turn": self._turn_counter,
                         },
                     ))
+                    # Spec 006: 元认知洞察同步写入 subconscious
+                    if report.insight_text:
+                        await self._memory.save(MemoryEntry(
+                            namespace="subconscious/metacognition_insight",
+                            key="latest",
+                            value={"insight_text": report.insight_text, "confidence": report.confidence},
+                        ))
                     self._meta_overrides.apply(report, self._turn_counter)
                     if self._emotion_engine:
                         self._emotion_engine.set_meta_overrides(self._meta_overrides)
@@ -684,6 +876,130 @@ class TurnManager:
                         key="latest",
                         value={"narrative": text, "turn": self._turn_counter},
                     ))
+
+            # ── Spec 009: 道德困境检测 ──
+            moral_conflict = self._moral_conflict_detector.detect(
+                user_message=user_message,
+                inner_thoughts=inner_thoughts,
+                relationship_stage=stage,
+                energy=self._energy_bar._state.energy,
+            )
+            if moral_conflict:
+                # 双脑 Pro/Con
+                conflict_context = f"困境: {moral_conflict.trigger_description}\n用户消息: {user_message}"
+                logic_score, logic_reason = await self.logic.pro_con(conflict_context)
+                emotion_score, emotion_reason = await self.emotion.pro_con(conflict_context)
+                moral_bias = (
+                    self._value_engine.get_modulation("moral_bias")
+                    if self._value_engine else None
+                )
+                assessment = self._pro_con_assessor.assess(
+                    logic_score, logic_reason, emotion_score, emotion_reason,
+                    moral_bias=moral_bias,
+                )
+                # 归档
+                await self._memory.save(MemoryEntry(
+                    namespace=f"self/moral/{self._turn_counter}",
+                    key="assessment",
+                    value={
+                        "conflict_type": moral_conflict.conflict_type.value,
+                        "logic_score": assessment.logic_score,
+                        "emotion_score": assessment.emotion_score,
+                        "recommended_path": assessment.recommended_path,
+                        "deadlock": assessment.deadlock,
+                        "escalation": assessment.escalation,
+                    },
+                ))
+                # 升级到元认知
+                if assessment.escalation and self._metacognition:
+                    self._metacognition.moral_escalation_pending = True
+                # 两难 → 写入 subconscious
+                if assessment.deadlock:
+                    await self._memory.save(MemoryEntry(
+                        namespace="subconscious/moral_conflict",
+                        key=str(self._turn_counter),
+                        value={
+                            "path": "deadlock",
+                            "logic": assessment.logic_reasoning,
+                            "emotion": assessment.emotion_reasoning,
+                        },
+                    ))
+
+            # ── Spec 008: 更新关系 + 群氛围 + 检测模式 ──
+            user_id = self._current_user_id
+
+            if self._relationship_engine.enabled:
+                recall_hit_count = len(memories)
+                ai_valence = 0.0
+                if self._emotion_engine:
+                    ai_state = self._emotion_engine.get_state("sub")
+                    ai_valence = getattr(ai_state, "valence", 0.0)
+
+                self._relationship_engine.update(
+                    user_id=user_id,
+                    recall_hit_count=recall_hit_count,
+                    combined_review_weight=review.combined_weight if review else 1.0,
+                    inner_thoughts_text=self._last_inner_thoughts or "",
+                    user_message=user_message,
+                    correction_accepted=(review.decision == DecisionType.CORRECT),
+                    memory_entry_count=len(memories),
+                    user_emotion_valence=0.0,
+                    ai_emotion_valence=ai_valence,
+                )
+
+            if self._emotion_engine and self._relationship_engine:
+                stage_enum = self._relationship_engine.get_stage(user_id)
+                self._emotion_engine.set_relationship_stage(
+                    stage_enum.value if stage_enum else None
+                )
+
+            # Spec 008: 群氛围情绪聚合（从 inner_thoughts → user_read.mood 反推）
+            if self._group_dynamics.enabled and self._current_turn:
+                parsed = self._current_turn.inner_thoughts_parsed
+                if parsed and parsed.user_read and parsed.user_read.mood:
+                    self._group_dynamics.record_emotion_snapshot(
+                        group_id=user_id,  # 群聊时为 group_id，私聊时退化为 user_id
+                        emotion_state={"mood": parsed.user_read.mood},
+                    )
+
+            if self._pattern_detector.enabled:
+                await self._pattern_detector.detect(
+                    user_id=user_id,
+                    user_message=user_message,
+                    inner_thoughts_text=self._last_inner_thoughts or "",
+                )
+
+            # ── Spec 011: 动机评估 ──
+            # 孤独检测（主观时钟驱动）
+            loneliness = self._loneliness_detector.tick(
+                wall_dt=60,  # 每 turn 约 60s
+                relationships=[(self._current_user_id, self._relationship_engine.get_stage(self._current_user_id).value)]
+                if self._relationship_engine else [],
+                subjective_speed=self._subjective_clock.speed_factor if self._subjective_clock else 1.0,
+            )
+            # 子Session 困惑度（从情绪引擎读取）
+            sub_confusion = self._emotion_engine.get_state("sub").confusion if self._emotion_engine else 0.0
+            sub_anger = self._emotion_engine.get_state("sub").anger if self._emotion_engine else 0.0
+            # 动机评估
+            motivation_state = self._motivation_engine.evaluate(
+                boredom=self._boredom_detector.get_boredom() if self._boredom_detector else 0,
+                energy=self._energy_bar._state.energy,
+                loneliness=loneliness,
+                confusion=sub_confusion,
+                unexpressed_anger=sub_anger,
+                value_weights={
+                    "growth": self._value_engine.values.growth,
+                    "care": self._value_engine.values.care,
+                    "honesty": self._value_engine.values.honesty,
+                    "self_improvement": self._value_engine.values.self_improvement,
+                } if self._value_engine else None,
+            )
+            hint = self._motivation_engine.build_injection(motivation_state)
+            await self._memory.save(MemoryEntry(
+                namespace="subconscious/motivations",
+                key="current",
+                value={"state": motivation_state.__dict__, "hint": hint},
+            ))
 
         except Exception:
             logger.exception("Async review failed, silently degraded")
@@ -1026,6 +1342,7 @@ class TurnManager:
             self._silence_accumulator.increment("defense_denial")
 
         # Spec 006: 标记本轮有防御（供元认知触发判定）
+        self._defense_history.append(defense.defense_type.value)
         self._had_defense_this_turn = True
 
     # ── 沉默归档 (T037) ─────────────────────────────────────
@@ -1038,6 +1355,39 @@ class TurnManager:
         """Silent archive: combined ≤ 0.5 → write to self/noticed, increment accumulator."""
         turn_id = self._current_turn.turn_id if self._current_turn else "unknown"
         reply_text = " ".join(replies)
+
+        # Spec 011: SilenceClassifier 语义化判定
+        silence_record = self._silence_classifier.classify(
+            review=review,
+            emotion=self._emotion_engine.get_state("sub") if self._emotion_engine else None,
+            energy=self._energy_bar._state.energy,
+            relationship_stage=self._relationship_engine.get_stage(self._current_user_id) if self._relationship_engine else None,
+            silence_streak=sum(self._silence_counters.values()),
+            active_turns=self._turn_counter,
+        )
+        increment = self._silence_classifier.get_silence_increment(silence_record.silence_type)
+        if increment > 0:
+            self._silence_accumulator.increment(silence_record.silence_type.value)
+        if silence_record.silence_type == SilenceType.OVERLOAD:
+            self._energy_bar.boost_recovery(self._silence_classifier.get_recovery_boost())
+        if (silence_record.silence_type == SilenceType.ANGRY
+                and self._emotion_engine):
+            self._emotion_engine.accelerate("sub", "resentment", 0.05)
+        await self._memory.save(MemoryEntry(
+            namespace="self/silences",
+            key=str(self._turn_counter),
+            value={"type": silence_record.silence_type.value, "reasoning": silence_record.reasoning},
+            entity_type="silence_record",
+            salience=5.0,
+        ))
+        # Spec 011: silence streak → 叙事事件
+        silence_streak_count = sum(self._silence_counters.values())
+        if silence_streak_count >= 3 and self._narrative_engine:
+            self._narrative_engine.append_chapter(
+                "silence_streak",
+                f"连续{silence_streak_count}次沉默，最近一次原因: {silence_record.reasoning}",
+                self._turn_counter,
+            )
 
         # Collect all error/issue types for silence accumulation
         for e in review.logic_errors:
@@ -1130,25 +1480,35 @@ class TurnManager:
         return summaries
 
     def _build_defense_summary(self) -> dict[str, Any]:
-        """构建防御模式总结（从 error_history 和 had_defense 标志提取）。"""
-        return {
-            "activation_rate": 0.0,
-            "main_types": "无",
-            "awareness_entries": [],
-        }
-
-    async def _build_memory_state(self) -> dict[str, Any]:
-        """构建记忆系统状态摘要（回溯统计 + 衰减预警）。"""
         try:
-            entries = await self._memory.query("self/inner_thoughts", limit=50)
-            total = len(entries)
+            recent = self._defense_history[-10:] if self._defense_history else []
+            unique = list(dict.fromkeys(recent))
             return {
-                "avg_recall_count": 0 if total == 0 else min(10, total),
-                "empty_recall_count": 0,
-                "decay_warning_count": 0,
-                "deep_memory_count": 0,
+                "activation_rate": round(len(self._defense_history) / max(1, self._turn_counter), 2),
+                "main_types": ", ".join(unique[-3:]) if unique else "无",
+                "error_counts": dict(self._error_history),
             }
         except Exception:
-            return {"avg_recall_count": 0, "empty_recall_count": 0, "decay_warning_count": 0, "deep_memory_count": 0}
+            return {"activation_rate": 0.0, "main_types": "无", "awareness_entries": []}
+
+    async def _build_memory_state(self) -> dict[str, Any]:
+        try:
+            deep_count = 0
+            decay_warnings = 0
+            entries = await self._memory.query("self/inner_thoughts", limit=50)
+            for e in entries:
+                curve = getattr(e, "decay_curve", "standard")
+                sal = getattr(e, "salience", 10.0)
+                if curve == "deep":
+                    deep_count += 1
+                if sal < 3.0:
+                    decay_warnings += 1
+            return {
+                "total_entries": len(entries),
+                "deep_memory_count": deep_count,
+                "decay_warning_count": decay_warnings,
+            }
+        except Exception:
+            return {"total_entries": 0, "deep_memory_count": 0, "decay_warning_count": 0}
 
 

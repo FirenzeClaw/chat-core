@@ -516,6 +516,42 @@ class LogicBrain:
             logger.warning(f"Metacognition pass failed: {e}")
             return None
 
+    # ── Spec 009: Pro/Con 道德评估 ─────────────────────────
+
+    async def pro_con(self, conflict_context: str) -> tuple[float, str]:
+        """Spec 009: 道德困境 Pro 评估 — 从逻辑/原则角度评估。
+
+        Returns:
+            (score, reasoning_text): score 在 [0, 1]，高分=倾向说真话
+        """
+        if not self._provider:
+            return (0.5, "[LogicBrain不可用]")
+        try:
+            prompt = (
+                "从逻辑和原则角度分析以下道德困境。给出一个分数 (0-1) 和简短推理。\n"
+                "分数含义: 1.0 = 必须坚持真相/原则, 0.0 = 应该优先保护关系。\n\n"
+                f"困境: {conflict_context}\n\n"
+                "格式: SCORE:<0-1的数字>\nREASONING:<一句话推理>"
+            )
+            result = await self._provider.chat(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3, max_tokens=128,
+            )
+            text = result.content if hasattr(result, 'content') else str(result)
+            score = 0.5
+            reasoning = text
+            for line in text.split("\n"):
+                if line.upper().startswith("SCORE:"):
+                    try:
+                        score = float(line.split(":", 1)[1].strip())
+                    except ValueError:
+                        pass
+                elif line.upper().startswith("REASONING:"):
+                    reasoning = line.split(":", 1)[1].strip()
+            return (max(0.0, min(1.0, score)), reasoning)
+        except Exception:
+            return (0.5, "[LogicBrain评估失败]")
+
     # ── Spec 010: 自我叙事 pass ───────────────────────────
 
     async def narrative_pass(self, context: str) -> str | None:
@@ -737,6 +773,42 @@ class EmotionBrain:
         self._history.extend(tool_inject_results)
 
         return injection
+
+    # ── Spec 009: Pro/Con 道德评估 ─────────────────────────
+
+    async def pro_con(self, conflict_context: str) -> tuple[float, str]:
+        """Spec 009: 道德困境 Pro 评估 — 从情感/关系角度评估。
+
+        Returns:
+            (score, reasoning_text): score 在 [0, 1]，高分=倾向保护关系
+        """
+        if not self._provider:
+            return (0.5, "[EmotionBrain不可用]")
+        try:
+            prompt = (
+                "从情感和关系角度分析以下道德困境。给出一个分数 (0-1) 和简短推理。\n"
+                "分数含义: 1.0 = 必须保护关系/感受, 0.0 = 应该说真话即使伤人。\n\n"
+                f"困境: {conflict_context}\n\n"
+                "格式: SCORE:<0-1的数字>\nREASONING:<一句话推理>"
+            )
+            result = await self._provider.chat(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3, max_tokens=128,
+            )
+            text = result.content if hasattr(result, 'content') else str(result)
+            score = 0.5
+            reasoning = text
+            for line in text.split("\n"):
+                if line.upper().startswith("SCORE:"):
+                    try:
+                        score = float(line.split(":", 1)[1].strip())
+                    except ValueError:
+                        pass
+                elif line.upper().startswith("REASONING:"):
+                    reasoning = line.split(":", 1)[1].strip()
+            return (max(0.0, min(1.0, score)), reasoning)
+        except Exception:
+            return (0.5, "[EmotionBrain评估失败]")
 
     async def _do_recall(self, args: dict) -> str:
         query = str(args.get("query", ""))

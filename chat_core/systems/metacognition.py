@@ -52,6 +52,9 @@ class MetacognitionEngine:
         self._self_criticism_counter: int = 0
         self._last_review_decision: str | None = None
 
+        # Spec 009: 道德升级标记
+        self.moral_escalation_pending: bool = False
+
     @property
     def enabled(self) -> bool:
         return self._enabled
@@ -114,6 +117,10 @@ class MetacognitionEngine:
             triggered = True
 
         # 5. 自我批评连续出现
+        # 6. 道德冲突升级 (Spec 009)
+        if getattr(self, "moral_escalation_pending", False):
+            triggered = True
+
         if inner_thoughts_text:
             if any(kw in inner_thoughts_text for kw in self._criticism_keywords):
                 self._self_criticism_counter += 1
@@ -130,6 +137,7 @@ class MetacognitionEngine:
             self._defense_streak_counter = 0
             self._self_criticism_counter = 0
             self._last_review_decision = None
+            self.moral_escalation_pending = False
 
         return triggered
 
@@ -147,6 +155,11 @@ class MetacognitionEngine:
         vulnerability_history: dict[str, Any] | None = None,
         value_state: dict[str, Any] | None = None,     # Spec 010
         narrative_text: str | None = None,             # Spec 010
+        relationship_stage: str | None = None,          # Spec 008
+        group_role_summary: dict[str, Any] | None = None,  # Spec 008
+        moral_conflict_context: str | None = None,      # Spec 009
+        silence_pattern: str | None = None,             # Spec 011
+        active_motivations: str | None = None,          # Spec 011
     ) -> str:
         """组装传递给 LogicBrain 的元认知审查上下文。
 
@@ -213,5 +226,31 @@ class MetacognitionEngine:
         # Spec 010: 自我叙述
         if narrative_text:
             parts.append(f"## 当前自我叙述\n  {narrative_text[:200]}")
+
+        # Spec 008: 关系阶段
+        if relationship_stage:
+            parts.append(f"## 当前关系阶段\n  与当前用户的关系: {relationship_stage}")
+
+        # Spec 008: 群角色摘要
+        if group_role_summary:
+            parts.append("## 群角色感知")
+            parts.append(f"  角色分数: {group_role_summary.get('role_score', 0):.2f}")
+            parts.append(f"  被@率: {group_role_summary.get('at_ratio', 0):.3f}")
+            parts.append(f"  互动率: {group_role_summary.get('engagement_rate', 0):.3f}")
+
+        # Spec 009: 道德困境升级
+        if moral_conflict_context:
+            parts.append("## 道德困境升级")
+            parts.append(f"  {moral_conflict_context}")
+
+        # Spec 011: 沉默模式
+        if silence_pattern:
+            parts.append("## 沉默模式")
+            parts.append(f"  {silence_pattern}")
+
+        # Spec 011: 当前动机
+        if active_motivations:
+            parts.append("## 当前动机")
+            parts.append(f"  {active_motivations}")
 
         return "\n".join(parts)

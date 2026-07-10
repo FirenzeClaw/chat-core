@@ -56,6 +56,7 @@ class DefenseEngine:
         meta_overrides: "MetaParamOverrides | None" = None,
         turn_counter: int = 0,
         value_engine: Any = None,  # Spec 010
+        relationship_modulation: Any = None,  # Spec 008: RelationshipModulation
     ) -> DefenseResult:
         """返回防御判定结果。
 
@@ -96,6 +97,10 @@ class DefenseEngine:
         # Spec 010: 价值观基线调制 (self_honesty factor)
         if value_engine is not None:
             final_prob *= value_engine.get_modulation("defense_prob_multiplier")
+
+        # Spec 008: 关系阶段调制防御概率
+        if relationship_modulation is not None:
+            final_prob *= relationship_modulation.defense_prob_mult
 
         # Spec 006: 元认知参数调制
         if meta_overrides is not None and not meta_overrides.is_expired(turn_counter):

@@ -217,13 +217,14 @@ class MemoryStore:
         cursor = await self._db.execute("PRAGMA table_info('memories')")
         columns = [row[1] for row in await cursor.fetchall()]
         if "created_at_epoch" not in columns:
+            # SQLite ALTER TABLE 不支持表达式默认值，先加列再回填
             await self._db.execute(
-                "ALTER TABLE memories ADD COLUMN created_at_epoch REAL DEFAULT (unixepoch())"
+                "ALTER TABLE memories ADD COLUMN created_at_epoch REAL DEFAULT 0.0"
             )
-            # 存量数据回填
+            # 存量数据回填：用 created_at 的 Unix 时间戳填充
             await self._db.execute(
                 "UPDATE memories SET created_at_epoch = unixepoch(created_at) "
-                "WHERE created_at_epoch IS NULL AND created_at IS NOT NULL"
+                "WHERE created_at_epoch = 0.0 AND created_at IS NOT NULL"
             )
             await self._db.commit()
 
@@ -745,6 +746,8 @@ class MemoryStore:
         stp = e.value.get("subjective_time_perception")
         if isinstance(stp, dict) and stp.get("perception") == "immersed":
             return "（那次聊得特别投入，时间过得飞快）"
+        elif isinstance(stp, dict) and stp.get("perception") == "dragging":
+            return "（时间过得特别慢，有点煎熬）"
         return ""
 
     def _derive_emotion_inference(self, entries: list[ChainedMemory]) -> str | None:
@@ -812,6 +815,30 @@ class MemoryStore:
         inference = self._derive_emotion_inference(entries)
         if inference:
             lines.append(inference)
+
+        # Spec 008: 跨群社交注解 — 检测同一用户在多个 namespace 的记忆
+        ns_groups: dict[str, list[str]] = {}
+        for cm in entries:
+            e = cm.entry
+            parts = e.namespace.split("/")
+            if len(parts) >= 2 and parts[0] in ("user", "c2c", "group"):
+                ns_key = "/".join(parts[:2])  # user/uid or c2c/uid or group/gid
+                if ns_key not in ns_groups:
+                    ns_groups[ns_key] = []
+                ns_groups[ns_key].append(e.key)
+
+        if len(ns_groups) > 1:
+            ns_descriptions = []
+            for ns, keys in ns_groups.items():
+                parts = ns.split("/")
+                if parts[0] == "group":
+                    ns_descriptions.append(f"群{parts[1]}")
+                elif parts[0] == "c2c":
+                    ns_descriptions.append("私聊")
+                else:
+                    ns_descriptions.append("其他场景")
+            if ns_descriptions:
+                lines.append(f"[跨群记忆] 这个用户在 {'、'.join(ns_descriptions)} 都出现过。")
 
         return "【记忆回溯】\n" + "\n".join(lines)
 

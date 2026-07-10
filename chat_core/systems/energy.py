@@ -80,6 +80,15 @@ class EnergyBar:
         self._state.last_update = time.time()
         return self._state.energy
 
+    def boost_recovery(self, multiplier: float = 2.0) -> None:
+        """Spec 011: OVERLOAD 沉默 → 加速恢复。
+        直接给 energy 加一跳，受 multiplier 放大。
+        """
+        if not self._enabled:
+            return
+        boost = self._rate_high * multiplier
+        self._state.energy = min(1.0, self._state.energy + boost)
+
     def should_exit(self) -> bool:
         """精力是否已耗尽（低于 exit 阈值）。"""
         return self._enabled and self._state.energy < self._exit_threshold

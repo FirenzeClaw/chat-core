@@ -90,6 +90,10 @@ class ReActLoop:
         # Spec 010: 自我叙事引擎
         self._narrative_engine = narrative_engine
 
+        # Spec 008: 关系上下文
+        self._relationship_context_hint: str | None = None
+        self._social_patterns_hint: str | None = None
+
         # 流式回调
         self._on_reply: Any = None  # async callable(text: str)
 
@@ -102,6 +106,15 @@ class ReActLoop:
 
         # 上下文退休回调 (Phase 7, T060)
         self._on_retirement: Any = None  # async callable(retirement_info: dict)
+
+        # Spec 009: 认知增强
+        self._intuition_engine: Any = None
+        self._creativity_engine: Any = None
+        self._humor_detector: Any = None
+        self._creativity_context_hint: str | None = None
+        self._humor_hint: str | None = None
+        self._motivation_hint: str | None = None  # Spec 011
+        self._intuition_pending_l2: bool = False
 
     # ── 公共接口 ────────────────────────────────────────────
 
@@ -196,6 +209,29 @@ class ReActLoop:
         self._replies.clear()
         self._init_messages(user_message)
 
+        # Spec 009: 直觉判定 — 可能跳过完整 ReAct
+        if self._intuition_engine and self._memory_store:
+            try:
+                from chat_core.core.types import IntuitionLevel
+                attention = self._attention_model.get_state_enum("sub") if self._attention_model else None
+                energy = self._energy_bar._state.energy if self._energy_bar else 1.0
+                chain_results = await self._memory_store.search_chained(user_message)
+                intuition = self._intuition_engine.evaluate(
+                    memory_results=chain_results,
+                    attention_state=attention,
+                    energy=energy,
+                    user_message=user_message,
+                )
+                if intuition.skip_react and intuition.fast_reply:
+                    self._replies.append(intuition.fast_reply)
+                    self._inner_thoughts_raw = intuition.inner_thoughts
+                    if self._on_reply:
+                        await self._on_reply(intuition.fast_reply)
+                    return
+                self._intuition_pending_l2 = (intuition.level == IntuitionLevel.L2_FAST_PATH)
+            except Exception:
+                pass
+
         # 注入潜意识纠正（Spec 004 T002）
         await self._inject_subconscious_corrections()
 
@@ -230,12 +266,24 @@ class ReActLoop:
             self._inject_attention_hint()
             self._inject_meta_mode_hint()
             self._inject_narrative()  # Spec 010
+            self._inject_relationship_context()  # Spec 008
+            self._inject_social_patterns()       # Spec 008
+            self._inject_creativity_context()   # Spec 009
+            self._inject_humor_hint()           # Spec 009
+            self._inject_motivation()          # Spec 011
+            self._inject_metacognition_insight()  # Spec 006
             return
         # 复用 Session: 追加用户消息，保留跨 turn 上下文
         self._messages.append(Message(role="user", content=user_message))
         self._inject_attention_hint()
         self._inject_meta_mode_hint()
         self._inject_narrative()  # Spec 010
+        self._inject_relationship_context()  # Spec 008
+        self._inject_social_patterns()       # Spec 008
+        self._inject_creativity_context()    # Spec 009
+        self._inject_humor_hint()            # Spec 009
+        self._inject_motivation()           # Spec 011
+        self._inject_metacognition_insight()  # Spec 006
 
     def _inject_attention_hint(self) -> None:
         """向消息历史注入注意力状态提示（在 system prompt 之后、用户消息之前）"""
@@ -284,6 +332,79 @@ class ReActLoop:
                 self._messages.insert(-1, Message(role="system", content=injection))
         except Exception:
             pass
+
+    def _inject_relationship_context(self) -> None:
+        """Spec 008: 注入关系阶段提示。"""
+        # 由 TurnManager 通过 set_relationship_context() 预先设置
+        hint = getattr(self, '_relationship_context_hint', None)
+        if hint:
+            self._messages.insert(-1, Message(role="system", content=hint))
+
+    def set_relationship_context(self, user_id: str, stage: str, description: str) -> None:
+        """设置关系阶段上下文（由 TurnManager 在子Session 启动前调用）"""
+        self._relationship_context_hint = (
+            f"[关系状态] 你与用户 {user_id} 的关系: {description} ({stage})"
+        )
+
+    def _inject_social_patterns(self) -> None:
+        """Spec 008: 注入社交模式提示。"""
+        hint = getattr(self, '_social_patterns_hint', None)
+        if hint:
+            self._messages.insert(-1, Message(role="system", content=hint))
+
+    def _inject_creativity_context(self) -> None:
+        """Spec 009: 注入创造力增强上下文"""
+        hint = getattr(self, '_creativity_context_hint', None)
+        if hint:
+            self._messages.insert(-1, Message(role="system", content=hint))
+
+    def _inject_humor_hint(self) -> None:
+        """Spec 009: 注入幽默提示"""
+        hint = getattr(self, '_humor_hint', None)
+        if hint:
+            self._messages.insert(-1, Message(role="system", content=hint))
+
+    def _inject_motivation(self) -> None:
+        """Spec 011: 注入动机提示"""
+        hint = getattr(self, '_motivation_hint', None)
+        if hint:
+            self._messages.insert(-1, Message(role="system", content=hint))
+
+    def set_motivation_hint(self, hint: str) -> None:
+        """Spec 011: 设置动机提示（由 TurnManager 在子Session 启动前调用）"""
+        self._motivation_hint = hint
+
+    def _inject_metacognition_insight(self) -> None:
+        """Spec 006: 注入元认知洞察到 system prompt。"""
+        hint = getattr(self, '_metacognition_insight_hint', None)
+        if hint:
+            self._messages.insert(-1, Message(role="system", content=hint))
+
+    def set_metacognition_insight(self, insight_text: str) -> None:
+        if insight_text:
+            self._metacognition_insight_hint = f"[自我洞察] {insight_text}"
+        else:
+            self._metacognition_insight_hint = None
+
+    def set_social_patterns(self, hint: str) -> None:
+        """设置社交模式提示（由 TurnManager 在子Session 启动前调用）"""
+        self._social_patterns_hint = hint
+
+    # Spec 009: 认知增强 setter
+    def set_intuition_engine(self, engine: Any) -> None:
+        self._intuition_engine = engine
+
+    def set_creativity_engine(self, engine: Any) -> None:
+        self._creativity_engine = engine
+
+    def set_humor_detector(self, detector: Any) -> None:
+        self._humor_detector = detector
+
+    def set_creativity_context(self, hint: str) -> None:
+        self._creativity_context_hint = hint
+
+    def set_humor_hint(self, hint: str) -> None:
+        self._humor_hint = hint
 
     async def _inject_subconscious_corrections(self) -> None:
         """查询 subconscious/corrections namespace，注入为 system message。
@@ -393,6 +514,52 @@ class ReActLoop:
 
     async def _think(self) -> NonStreamResult | None:
         """调用 LLM（流式），返回其决策"""
+
+        # Spec 009: L2 Fast Path — 单次 Flash 调用，跳过完整 function calling
+        if self._intuition_pending_l2 and self._intuition_engine:
+            self._intuition_pending_l2 = False  # 一次性消费
+            try:
+                cfg = get_config()
+                l2_cfg = cfg.intuition_config().get("level2", {})
+                flash_model = l2_cfg.get("model", "deepseek-v4-flash")
+                confidence_threshold = float(l2_cfg.get("confidence_threshold", 0.7))
+                reasoning = l2_cfg.get("reasoning_effort", "low")
+
+                # 构建 Fast Path prompt：用户消息 + 直觉模式标记
+                fast_prompt = (
+                    f"{self._messages[-1].content}\n"
+                    "[直觉模式] 快速给出你的第一反应，不需要深度分析。"
+                )
+
+                result = await self._provider.chat(
+                    messages=[{"role": "user", "content": fast_prompt}],
+                    model=flash_model,
+                    temperature=0.7,
+                    max_tokens=256,
+                    reasoning_effort=reasoning,
+                )
+                reply_text = result.content if hasattr(result, 'content') else str(result)
+
+                # 置信度判定
+                confidence = self._intuition_engine.eval_fast_path_confidence(reply_text, "")
+                if confidence >= confidence_threshold:
+                    self._replies.append(reply_text)
+                    self._inner_thoughts_raw = "[快速反应] 第一反应，未经深度思考"
+                    self._done = True
+                    if self._on_reply:
+                        await self._on_reply(reply_text)
+                    # 合成 NonStreamResult 以兼容 _act() 流程
+                    return NonStreamResult(
+                        content=reply_text,
+                        tool_calls=[],
+                        usage=Usage.zero(),
+                    )
+                # 置信度不足 → 回落 L3，消息追加为上下文后继续正常 ReAct
+                self._messages.append(Message(role="assistant", content=reply_text))
+                self._messages.append(Message(role="system", content="[直觉模式] 上面的快速反应不够好，现在进行完整的深入思考。"))
+            except Exception:
+                pass  # L2 失败 → 静默降级到 L3
+
         cfg = get_config()
         brain_cfg = cfg.brain_api_config("sub_session")
 

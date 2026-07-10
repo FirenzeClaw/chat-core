@@ -23,6 +23,8 @@ from chat_core.core.prompt_engine import PromptEngine
 from chat_core.core.tools import ToolRegistry
 from chat_core.core.types import (
     AttentionEvent,
+    DecisionType,
+    DefenseType,
     MemoryEntry,
     Message,
     RecallChainConfig,
@@ -35,9 +37,21 @@ from chat_core.systems.attention import AttentionModel
 from chat_core.systems.interest import InterestModel
 from chat_core.systems.review import ReviewSystem
 from chat_core.systems.boredom import BoredomDetector
+from chat_core.systems.defense import DefenseEngine
 from chat_core.systems.energy import EnergyBar
 from chat_core.systems.subjective_time import SubjectiveClock
 from chat_core.systems.proactive import ProactiveSystem
+from chat_core.systems.group_dynamics import GroupDynamics  # Spec 008
+from chat_core.systems.patterns import PatternDetector  # Spec 008
+from chat_core.systems.relationship import RelationshipEngine  # Spec 008
+from chat_core.systems.silence import SilenceClassifier, SilenceType  # Spec 011
+from chat_core.systems.motivation import MotivationEngine  # Spec 011
+from chat_core.systems.loneliness import LonelinessDetector  # Spec 011
+from chat_core.systems.values import ValueEngine  # Spec 010
+from chat_core.systems.intuition import IntuitionEngine  # Spec 009
+from chat_core.systems.creativity import CreativityEngine  # Spec 009
+from chat_core.systems.humor import HumorDetector  # Spec 009
+from chat_core.systems.moral import MoralConflictDetector, ProConAssessor  # Spec 009
 from chat_core.qq.protocol import MessageContext, fetch_user_nickname, send_message
 from chat_core.qq.sessions import SessionManager, UserSession
 from chat_core.qq.race_tracker import RaceTracker
@@ -106,9 +120,38 @@ class BotAdapter:
         # ReviewSystem
         self._review_system = ReviewSystem(provider, memory_store)
 
+        # Spec 010: 价值观引擎
+        self._value_engine = ValueEngine()
+        # Spec 005: 防御机制
+        self._defense_engine = DefenseEngine()
+        self._error_history: dict[str, int] = {}
+        # Spec 008+: 运行时状态
+        self.runtime_state: dict[str, Any] = {}
+
         # Spec 007: 具身感知 — 精力条 + 主观时钟 (必须在 BoredomDetector 之前)
         self._energy_bar = EnergyBar()
         self._subjective_clock = SubjectiveClock()
+
+        # Spec 008: 群动力学
+        self._group_dynamics = GroupDynamics()
+        self._group_dynamics.set_memory(memory_store)
+
+        # Spec 008: 社交关系 + 习惯模式
+        self._relationship_engine = RelationshipEngine()
+        self._pattern_detector = PatternDetector()
+        self._pattern_detector.set_memory(memory_store)
+
+        # Spec 011: 沉默语义 + 动机 + 孤独
+        self._silence_classifier = SilenceClassifier()
+        self._motivation_engine = MotivationEngine()
+        self._loneliness_detector = LonelinessDetector()
+
+        # Spec 009: 认知增强
+        self._intuition_engine = IntuitionEngine()
+        self._creativity_engine = CreativityEngine()
+        self._humor_detector = HumorDetector()
+        self._moral_detector = MoralConflictDetector()
+        self._pro_con_assessor = ProConAssessor()
 
         # BoredomDetector (Spec 007: subjective_clock + energy_bar 联动)
         self._boredom_detector = BoredomDetector(
@@ -150,6 +193,13 @@ class BotAdapter:
         send_fn: Any = None,
     ) -> list[str]:
         """处理一条 QQ 消息。send_fn 传入时，send_reply 逐段直接发送。"""
+        # Spec 008: 群聊统计
+        if ctx.is_group:
+            if ctx.is_at:
+                self._group_dynamics.record_at(ctx.group_id, member_count=0)
+            else:
+                self._group_dynamics.record_observe(ctx.group_id)
+
         # 私聊开关关闭 → 静默跳过
         if not ctx.is_group and not self._c2c_reply_enabled:
             return []
@@ -188,6 +238,12 @@ class BotAdapter:
     async def _process(self, ctx: MessageContext, send_fn: Any = None) -> list[str]:
         user_session = self._sessions.get_or_create(ctx.user_id, ctx.session_key)
 
+        # Spec 008: 群聊统计补充
+        if ctx.is_group:
+            if ctx.is_at:
+                self._group_dynamics.record_reply(ctx.group_id)
+            self._group_dynamics.record_active_day(ctx.group_id)
+
         if user_session.turn_counter == 0:
             await self._ensure_profile(ctx)
 
@@ -220,6 +276,31 @@ class BotAdapter:
 
         loop.set_reply_callback(_on_reply)
 
+        # Spec 008: 应用关系阶段人格调制
+        if self._personality_engine and self._relationship_engine:
+            stage = self._relationship_engine.get_stage(ctx.user_id)
+            modulation = self._relationship_engine.get_modulation(ctx.user_id)
+            mod_params = self._personality_engine.apply_relationship_modulation(
+                stage=stage, modulation=modulation
+            )
+            self.runtime_state["relationship_modulation"] = mod_params
+
+        # Spec 009: 创造力上下文
+        if self._creativity_engine.enabled:
+            creativity_ctx = await self._run_creativity_dual_path(ctx.content)
+            if creativity_ctx:
+                loop.set_creativity_context(creativity_ctx)
+        # Spec 009: 幽默检测
+        if self._humor_detector.enabled:
+            stage = (
+                self._relationship_engine.get_stage(ctx.user_id)
+                if self._relationship_engine else None
+            )
+            opportunities = self._humor_detector.detect(ctx.content, stage)
+            humor_hint = self._humor_detector.build_injection(opportunities)
+            if humor_hint:
+                loop.set_humor_hint(humor_hint)
+
         logger.info(
             "开始处理: user=%s session=%s turn=%d severity=%s",
             ctx.user_id[:12], ctx.session_key, user_session.turn_counter, severity,
@@ -233,6 +314,39 @@ class BotAdapter:
 
         # 等待双脑注入完成（如果还没完），保证归档时可取到
         _context, memories = await inject_task
+
+        # Spec 008: 更新用户关系梯度
+        if self._relationship_engine.enabled:
+            ai_valence = 0.0
+            if self._emotion_engine:
+                ai_state = self._emotion_engine.get_state("sub")
+                ai_valence = getattr(ai_state, "valence", 0.0)
+            self._relationship_engine.update(
+                user_id=ctx.user_id,
+                recall_hit_count=0,
+                combined_review_weight=0.5,
+                inner_thoughts_text=loop.inner_thoughts or "",
+                user_message=ctx.content,
+                correction_accepted=False,
+                memory_entry_count=len(memories) if memories else 0,
+                user_emotion_valence=0.0,
+                ai_emotion_valence=ai_valence,
+            )
+
+        # Spec 008: 检测用户习惯模式
+        if self._pattern_detector.enabled:
+            await self._pattern_detector.detect(
+                user_id=ctx.user_id,
+                user_message=ctx.content,
+                inner_thoughts_text=loop.inner_thoughts or "",
+            )
+
+        # Spec 005/008: 通知 EmotionEngine 当前关系阶段（脆弱安全门）
+        if self._emotion_engine and self._relationship_engine:
+            stage_enum = self._relationship_engine.get_stage(ctx.user_id)
+            self._emotion_engine.set_relationship_stage(
+                stage_enum.value if stage_enum else None
+            )
 
         segs = list(loop.replies) if loop.replies else segments
         if not segs:
@@ -254,6 +368,40 @@ class BotAdapter:
         if loop.inner_thoughts:
             self._proactive._record_topics_from_thoughts(loop.inner_thoughts)
 
+        # Spec 005: 脆弱感检测
+        if self._emotion_engine and self._emotion_engine.is_vulnerable:
+            await self._memory.save(MemoryEntry(
+                namespace=f"user/{ctx.user_id}/c2c/conversations",
+                key=f"vulnerability_{int(time.time())}",
+                value={
+                    "type": "vulnerability_exposed",
+                    "turn": user_session.turn_counter,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+            ))
+
+        # Spec 011: 孤独感更新
+        if self._loneliness_detector and self._relationship_engine:
+            stage = self._relationship_engine.get_stage(ctx.user_id)
+            rel_list = [(ctx.user_id, stage.value)] if stage else []
+            speed = self._subjective_clock.speed_factor if self._subjective_clock else 1.0
+            self._loneliness_detector.tick(60.0, rel_list, subjective_speed=speed)
+
+        # Spec 011: 动机评估 → 注入子 Session 下一轮
+        if self._motivation_engine.enabled:
+            ms = self._motivation_engine.evaluate(
+                boredom=self._boredom_detector.get_boredom(),
+                energy=self._energy_bar._state.energy,
+                loneliness=self._loneliness_detector.level,
+            )
+            hint = self._motivation_engine.build_injection(ms)
+            if hint:
+                loop.set_motivation_hint(hint)
+
+        # Spec 009: 道德困境检测 (fire-and-forget)
+        if self._moral_detector.enabled:
+            asyncio.create_task(self._moral_check(ctx, loop, user_session))
+
         # 对话结束 → 启动无聊检测 (FR-19)
         self._on_conversation_ended()
 
@@ -263,8 +411,16 @@ class BotAdapter:
             self._energy_bar.consume(reply_count=len(segs), compound_delta=compound_delta)
 
         logger.info(
-            "Turn 完成: user=%s turn=%d segments=%d",
+            "Turn 完成: user=%s turn=%d segments=%d | spec: rel=%s pat=%s sil=%s mot=%s lon=%.2f cre=%s hum=%s mor=%s",
             ctx.user_id[:12], user_session.turn_counter, len(segs),
+            "on" if self._relationship_engine and self._relationship_engine.enabled else "off",
+            "on" if self._pattern_detector and self._pattern_detector.enabled else "off",
+            "on" if self._silence_classifier else "off",
+            "on" if self._motivation_engine and self._motivation_engine.enabled else "off",
+            self._loneliness_detector.level if self._loneliness_detector else 0.0,
+            "on" if self._creativity_engine and self._creativity_engine.enabled else "off",
+            "on" if self._humor_detector and self._humor_detector.enabled else "off",
+            "on" if self._moral_detector and self._moral_detector.enabled else "off",
         )
         return segs
 
@@ -309,6 +465,19 @@ class BotAdapter:
 
         from chat_core.systems.proactive import _enhance_recall
         _enhance_recall(tools, self._memory, self._personality_engine)
+
+        # Spec 008: 设置关系上下文
+        if self._relationship_engine:
+            stage = self._relationship_engine.get_stage(user_id)
+            desc = self._relationship_engine.get_stage_description(stage)
+            loop.set_relationship_context(user_id, stage.value, desc)
+        # Spec 008: 设置社交模式
+        if self._pattern_detector:
+            pattern_hint = self._pattern_detector.get_pattern_injection(user_id)
+            if pattern_hint:
+                loop.set_social_patterns(pattern_hint)
+        # Spec 009: 直觉引擎
+        loop.set_intuition_engine(self._intuition_engine)
 
         self._sub_sessions[session_key] = loop
         return loop
@@ -390,6 +559,45 @@ class BotAdapter:
 
         combined = review.combined_weight
 
+        # Spec 005: 防御判定（仅 CORRECT 决策且 combined > 0.5）
+        if review.decision == DecisionType.CORRECT and review.combined_weight > 0.5:
+            impulsiveness = (
+                self._personality_engine.weights.impulsiveness
+                if self._personality_engine else 0.2
+            )
+            for e in review.logic_errors:
+                et = e.error_type.value if hasattr(e.error_type, 'value') else str(e.error_type)
+                self._error_history[et] = self._error_history.get(et, 0) + 1
+            compound_delta = (
+                self._emotion_engine.last_compound_delta
+                if self._emotion_engine else 0.0
+            )
+            defense = self._defense_engine.evaluate(
+                review, self._error_history,
+                impulsiveness=impulsiveness,
+                last_compound_delta=compound_delta,
+                is_vulnerable=(
+                    self._emotion_engine.is_vulnerable
+                    if self._emotion_engine else False
+                ),
+                value_engine=self._value_engine,
+                relationship_modulation=(
+                    self._relationship_engine.get_modulation(ctx.user_id)
+                    if self._relationship_engine else None
+                ),
+            )
+            if defense.defense_type != DefenseType.DIRECT:
+                await self._memory.save(MemoryEntry(
+                    namespace="subconscious/nudges",
+                    key=f"defense_{ctx.session_key}_{int(time.time())}",
+                    value={
+                        "defense_type": defense.defense_type.value,
+                        "correction_text": defense.correction_text,
+                        "combined_weight": review.combined_weight,
+                    },
+                ))
+                return
+
         if combined > 0.5:
             # 写入 subconscious/corrections，下一轮子Session 自动读取纠正
             try:
@@ -443,6 +651,29 @@ class BotAdapter:
             except Exception:
                 logger.exception("写入 corrections 失败: user=%s", ctx.user_id[:12])
         else:
+            # Spec 011: 沉默语义化判定
+            try:
+                silence_record = self._silence_classifier.classify(
+                    review=review,
+                    emotion=self._emotion_engine.get_state("sub") if self._emotion_engine else None,
+                    energy=self._energy_bar._state.energy,
+                    relationship_stage=(
+                        self._relationship_engine.get_stage(ctx.user_id)
+                        if self._relationship_engine else None
+                    ),
+                    silence_streak=0,
+                    active_turns=0,
+                )
+                if silence_record.silence_type == SilenceType.OVERLOAD:
+                    self._energy_bar.boost_recovery(
+                        self._silence_classifier.get_recovery_boost()
+                    )
+                if (silence_record.silence_type == SilenceType.ANGRY
+                        and self._emotion_engine):
+                    self._emotion_engine.accelerate("sub", "resentment", 0.05)
+            except Exception:
+                logger.debug("沉默分类失败: user=%s", ctx.user_id[:12])
+
             # combined ≤ 0.5: 归档到 self/noticed/
             try:
                 await self._memory.save(MemoryEntry(
@@ -685,6 +916,86 @@ class BotAdapter:
         self._boredom_detector.start(eval_param, interest_weight, impulsiveness)
         logger.debug("无聊检测已启动: eval=%.2f interest=%.2f impulsiveness=%.2f",
                      eval_param, interest_weight, impulsiveness)
+
+    async def _run_creativity_dual_path(self, user_message: str) -> str | None:
+        """Spec 009: 创造力双路径。CreativityEngine 不负责 LLM 调用——adapter 自行编排。"""
+        playfulness = (
+            self._personality_engine.weights.playfulness
+            if self._personality_engine else 0.5
+        )
+        if not self._creativity_engine.should_trigger(playfulness, user_message):
+            return None
+        # Path A: Flash LLM 概念发散
+        prompt = self._creativity_engine.build_path_a_prompt(user_message)
+        try:
+            response = await self._provider.chat(
+                messages=[Message(role="user", content=prompt)],
+                model="deepseek-v4-flash",
+                max_tokens=256,
+                temperature=0.9,
+            )
+            path_a_mappings = self._creativity_engine.parse_path_a_result(response.content)
+        except Exception:
+            logger.debug("Path A Flash 调用失败")
+            path_a_mappings = []
+        # Path B: 联锁检索放大
+        try:
+            chain_config = self._creativity_engine.get_extended_chain_config()
+            results = await self._memory.search_chained(user_message, chain_config)
+            path_b_summaries = self._creativity_engine.filter_path_b_memories(results)
+        except Exception:
+            logger.debug("Path B 联锁检索失败")
+            path_b_summaries = []
+        return self._creativity_engine.build_injection(path_a_mappings, path_b_summaries)
+
+    async def _moral_check(
+        self, ctx: MessageContext, loop: ReActLoop, user_session: UserSession,
+    ) -> None:
+        """Spec 009: 道德困境检测 + Pro/Con 双脑 (fire-and-forget)。"""
+        try:
+            stage = (
+                self._relationship_engine.get_stage(ctx.user_id)
+                if self._relationship_engine else None
+            )
+            moral_conflict = self._moral_detector.detect(
+                user_message=ctx.content,
+                inner_thoughts=loop.inner_thoughts,
+                relationship_stage=stage,
+                energy=self._energy_bar._state.energy,
+            )
+            if not moral_conflict or not self._logic_brain or not self._emotion_brain:
+                return
+            conflict_ctx = f"困境: {moral_conflict.trigger_description}\n用户消息: {ctx.content}"
+            logic_score, logic_reason = await self._logic_brain.pro_con(conflict_ctx)
+            emotion_score, emotion_reason = await self._emotion_brain.pro_con(conflict_ctx)
+            moral_bias = (
+                self._value_engine.get_modulation("moral_bias")
+                if self._value_engine else None
+            )
+            assessment = self._pro_con_assessor.assess(
+                logic_score, logic_reason, emotion_score, emotion_reason,
+                moral_bias=moral_bias,
+            )
+            await self._memory.save(MemoryEntry(
+                namespace=f"self/moral/{user_session.turn_counter}",
+                key="assessment",
+                value={
+                    "conflict_type": moral_conflict.conflict_type.value,
+                    "logic_score": assessment.logic_score,
+                    "emotion_score": assessment.emotion_score,
+                    "recommended_path": assessment.recommended_path,
+                    "deadlock": assessment.deadlock,
+                    "escalation": assessment.escalation,
+                },
+            ))
+            if assessment.deadlock:
+                await self._memory.save(MemoryEntry(
+                    namespace="subconscious/moral_conflict",
+                    key=str(user_session.turn_counter),
+                    value={"path": "deadlock", "logic": assessment.logic_reasoning, "emotion": assessment.emotion_reasoning},
+                ))
+        except Exception:
+            logger.debug("道德检测失败: user=%s", ctx.user_id[:12])
 
     def _on_conversation_started(self) -> None:
         """新对话开始 — 停止无聊检测，检查延迟意图。"""
