@@ -346,19 +346,28 @@ class ReviewSystem:
         emotion_weight: float,
         meta_overrides: "MetaParamOverrides | None" = None,
         turn_counter: int = 0,
+        value_engine: Any = None,  # Spec 010
     ) -> DecisionType:
         """Weighted decision: combined = logic * 0.5 + emotion * 0.5.
 
         > threshold → CORRECT (or TWISTED if logic > 0.8 and emotion < 0.3)
         ≤ threshold → SILENCE
 
-        Spec 006: threshold 由 meta_overrides.get_review_threshold() 动态计算。
+        Spec 010: threshold = base_honesty × value_engine.get_modulation("review_threshold")
+        Spec 006: + meta_overrides offset (applied after baseline modulation).
         """
         combined = logic_weight * 0.5 + emotion_weight * 0.5
 
-        threshold = 0.5
+        base_threshold = 0.5
+        # Spec 010: 价值观基线调制 (honesty factor)
+        if value_engine is not None:
+            base_threshold *= value_engine.get_modulation("review_threshold")
+
+        # Spec 006: 元认知偏移 (applied after baseline)
         if meta_overrides is not None:
-            threshold = meta_overrides.get_review_threshold(base=0.5, turn_counter=turn_counter)
+            threshold = meta_overrides.get_review_threshold(base=base_threshold, turn_counter=turn_counter)
+        else:
+            threshold = base_threshold
 
         if combined > threshold:
             # T038: Twisted state check
@@ -476,6 +485,7 @@ class ReviewSystem:
             logic_weight, emotion_weight,
             meta_overrides=kwargs.get("meta_overrides"),
             turn_counter=kwargs.get("turn_counter", 0),
+            value_engine=kwargs.get("value_engine"),  # Spec 010
         )
 
         return review

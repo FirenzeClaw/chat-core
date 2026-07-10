@@ -39,6 +39,8 @@ from chat_core.systems.interest import InterestModel, SilenceAccumulator
 from chat_core.systems.boredom import BoredomDetector
 from chat_core.systems.energy import EnergyBar
 from chat_core.systems.metacognition import MetacognitionEngine
+from chat_core.systems.values import ValueEngine  # Spec 010
+from chat_core.systems.narrative import NarrativeEngine  # Spec 010
 from chat_core.systems.subjective_time import SubjectiveClock
 from chat_core.systems.proactive import ProactiveSystem, _enhance_recall
 
@@ -120,6 +122,12 @@ class TurnManager:
         self._meta_overrides = MetaParamOverrides()  # 容器始终存在（禁用时保持默认值）
         self._last_inner_thoughts: str | None = None
         self._had_defense_this_turn: bool = False
+
+        # Spec 010: 价值体系 + 自我叙事
+        vc_cfg = cfg.value_config()
+        nc_cfg = cfg.narrative_config()
+        self._value_engine = ValueEngine() if vc_cfg.get("enabled", True) else None
+        self._narrative_engine = NarrativeEngine() if nc_cfg.get("enabled", True) else None
 
         self._boredom_detector = BoredomDetector(
             attention_model=attention_model,
@@ -355,6 +363,13 @@ class TurnManager:
                     },
                 ))
                 self._emotion_engine.is_vulnerable = False  # 重置脆弱标志
+                # Spec 010: 脆弱暴露 → 叙事章节
+                if self._narrative_engine:
+                    self._narrative_engine.append_chapter(
+                        event_type="vulnerability",
+                        text=f"我在对话中暴露了脆弱（{vuln_emotion}）。这对我来说不容易。",
+                        turn=self._turn_counter,
+                    )
                 # 恢复人格权重（self_disclosure 调制清除）
                 if self._personality_engine and hasattr(self, "_vuln_orig_empathy"):
                     self._personality_engine.weights.empathy = self._vuln_orig_empathy
@@ -464,6 +479,7 @@ class TurnManager:
             memory_store=self._memory,
             energy_bar=self._energy_bar,
             meta_overrides=self._meta_overrides,  # Spec 006
+            narrative_engine=self._narrative_engine,  # Spec 010
         )
         register_sub_session_tools(tools, loop, attention_model=self._attention_model)
 
@@ -496,6 +512,7 @@ class TurnManager:
             user_message=user_message,
             meta_overrides=self._meta_overrides,  # Spec 006
             turn_counter=self._turn_counter,
+            value_engine=self._value_engine,  # Spec 010
         )
 
     # ── 异步审查 + 决策 (T005) ───────────────────────────────
@@ -549,6 +566,7 @@ class TurnManager:
                     ),
                     meta_overrides=self._meta_overrides,  # Spec 006
                     turn_counter=self._turn_counter,
+                    value_engine=self._value_engine,  # Spec 010
                 )
                 if defense.defense_type != DefenseType.DIRECT:
                     await self._apply_defense(defense, review, replies)
@@ -649,6 +667,23 @@ class TurnManager:
                     self._meta_overrides.apply(report, self._turn_counter)
                     if self._emotion_engine:
                         self._emotion_engine.set_meta_overrides(self._meta_overrides)
+                    # Spec 010: 元认知发现防御 → self_honesty↑ (仅当本轮确有防御)
+                    if self._value_engine and had_defense:
+                        self._value_engine.adjust("metacognition_defense")
+
+            # ── Spec 010: 定期自我叙事生成 ──
+            if self._narrative_engine and self._turn_counter % self._narrative_engine._periodic_interval == 0:
+                ctx = self._narrative_engine.build_narrative_context(
+                    value_engine=self._value_engine
+                )
+                text = await self.logic.narrative_pass(ctx)
+                if text:
+                    self._narrative_engine.update_latest(text)
+                    await self._memory.save(MemoryEntry(
+                        namespace="self/narrative",
+                        key="latest",
+                        value={"narrative": text, "turn": self._turn_counter},
+                    ))
 
         except Exception:
             logger.exception("Async review failed, silently degraded")

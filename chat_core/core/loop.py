@@ -56,6 +56,7 @@ class ReActLoop:
         memory_store: Any = None,
         energy_bar: Any = None,
         meta_overrides: Any = None,
+        narrative_engine: Any = None,  # Spec 010
     ):
         self._provider = provider
         self._tools = tool_registry
@@ -85,6 +86,9 @@ class ReActLoop:
 
         # Spec 006: 元认知参数覆盖
         self._meta_overrides = meta_overrides
+
+        # Spec 010: 自我叙事引擎
+        self._narrative_engine = narrative_engine
 
         # 流式回调
         self._on_reply: Any = None  # async callable(text: str)
@@ -225,11 +229,13 @@ class ReActLoop:
             ]
             self._inject_attention_hint()
             self._inject_meta_mode_hint()
+            self._inject_narrative()  # Spec 010
             return
         # 复用 Session: 追加用户消息，保留跨 turn 上下文
         self._messages.append(Message(role="user", content=user_message))
         self._inject_attention_hint()
         self._inject_meta_mode_hint()
+        self._inject_narrative()  # Spec 010
 
     def _inject_attention_hint(self) -> None:
         """向消息历史注入注意力状态提示（在 system prompt 之后、用户消息之前）"""
@@ -265,6 +271,17 @@ class ReActLoop:
             hint = mode_hints.get(mode, "")
             if hint:
                 self._messages.insert(-1, Message(role="system", content=hint))
+        except Exception:
+            pass
+
+    def _inject_narrative(self) -> None:
+        """Spec 010: 注入自我叙述到 system prompt。"""
+        if self._narrative_engine is None:
+            return
+        try:
+            injection = self._narrative_engine.get_system_injection()
+            if injection:
+                self._messages.insert(-1, Message(role="system", content=injection))
         except Exception:
             pass
 

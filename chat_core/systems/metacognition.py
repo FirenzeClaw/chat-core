@@ -145,6 +145,8 @@ class MetacognitionEngine:
         energy_state: dict[str, Any] | None = None,
         subjective_time: dict[str, Any] | None = None,
         vulnerability_history: dict[str, Any] | None = None,
+        value_state: dict[str, Any] | None = None,     # Spec 010
+        narrative_text: str | None = None,             # Spec 010
     ) -> str:
         """组装传递给 LogicBrain 的元认知审查上下文。
 
@@ -197,5 +199,19 @@ class MetacognitionEngine:
             parts.append("## 脆弱历史")
             parts.append(f"  当前是否脆弱: {vulnerability_history.get('is_vulnerable', False)}")
             parts.append(f"  冷却剩余: {vulnerability_history.get('cooldown_remaining', 0)}轮")
+
+        # Spec 010: 价值观状态
+        if value_state:
+            parts.append("## 价值观状态")
+            parts.append(f"  Honesty: {value_state.get('honesty', 0):.2f}, "
+                         f"Care: {value_state.get('care', 0):.2f}, "
+                         f"Growth: {value_state.get('growth', 0):.2f}")
+            parts.append(f"  self_honesty: {value_state.get('self_honesty', 0):.2f}, "
+                         f"nurturing: {value_state.get('nurturing', 0):.2f}, "
+                         f"loyalty: {value_state.get('loyalty', 0):.2f}")
+
+        # Spec 010: 自我叙述
+        if narrative_text:
+            parts.append(f"## 当前自我叙述\n  {narrative_text[:200]}")
 
         return "\n".join(parts)
