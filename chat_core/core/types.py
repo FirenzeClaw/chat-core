@@ -528,3 +528,46 @@ class MetaParamOverrides:
 SELF_CRITICISM_KEYWORDS: list[str] = [
     "不该这么说", "又说错了", "太机械了", "没意思", "不想聊了",
 ]
+
+
+# ── Spec 010: 价值体系 + 自我叙事 ──────────────────────────
+
+@dataclass
+class VirtueNode:
+    """价值观三层树节点"""
+    weight: float = 0.0
+    children: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class ValueSystem:
+    """完整价值观系统 — 3 美德 × 3 子价值观"""
+    honesty: float = 0.7
+    care: float = 0.6
+    growth: float = 0.8
+    truthfulness: float = 0.8
+    self_honesty: float = 0.7
+    transparency: float = 0.5
+    empathy_protection: float = 0.6
+    loyalty: float = 0.5
+    nurturing: float = 0.7
+    curiosity_drive: float = 0.8
+    self_improvement: float = 0.7
+    openness: float = 0.6
+
+
+@dataclass
+class NarrativeEntry:
+    """自我叙事章节 — 事件驱动的增量片段"""
+    timestamp: str = ""
+    event_type: str = ""
+    text: str = ""
+    turn: int = 0
+
+
+@dataclass
+class NarrativeState:
+    """自我叙事完整状态"""
+    latest: str = ""
+    chapters: list[NarrativeEntry] = field(default_factory=list)
+    timeline_keys: list[str] = field(default_factory=list)

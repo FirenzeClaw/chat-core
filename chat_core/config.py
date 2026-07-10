@@ -212,6 +212,14 @@ class Config:
         """返回 systems.metacognition 配置"""
         return self.systems.get("metacognition", {})
 
+    def value_config(self) -> dict[str, Any]:
+        """返回 systems.values 配置 (Spec 010)"""
+        return self.systems.get("values", {})
+
+    def narrative_config(self) -> dict[str, Any]:
+        """返回 systems.narrative 配置 (Spec 010)"""
+        return self.systems.get("narrative", {})
+
     def qq_config(self) -> dict[str, Any]:
         return self._data.get("qq_bot", {})
 

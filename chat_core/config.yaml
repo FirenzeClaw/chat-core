@@ -256,6 +256,51 @@ systems:
     confidence_threshold: 0.6     # 低于此只应用文本，不调参数
     override_expiry_turns: 5      # 参数覆盖 N 轮后自动过期
 
+  values:
+    enabled: true
+    virtues:
+      honesty:
+        weight: 0.7
+        children:
+          truthfulness: 0.8
+          self_honesty: 0.7
+          transparency: 0.5
+      care:
+        weight: 0.6
+        children:
+          empathy_protection: 0.6
+          loyalty: 0.5
+          nurturing: 0.7
+      growth:
+        weight: 0.8
+        children:
+          curiosity_drive: 0.8
+          self_improvement: 0.7
+          openness: 0.6
+    dynamics:
+      honesty_hurt_relation: {honesty: -0.03, care: 0.05}
+      silence_regret: {honesty: +0.03, self_honesty: +0.02}
+      metacognition_defense_found: {self_honesty: +0.05}
+      positive_impact: {nurturing: +0.05}
+      stage_upgrade: {loyalty: +0.05, honesty: +0.03}
+    modulation:
+      review_threshold: "base × honesty"
+      defense_prob: "min(base × (2.0 - self_honesty), 0.95)"
+      moral_conflict_bias: "truthfulness / (truthfulness + empathy_protection)"
+
+  narrative:
+    enabled: true
+    periodic_interval: 10
+    max_length: 300
+    event_driven:
+      stage_change: true
+      moral_conflict: true
+      silence_streak: 3
+      deep_memory_new: true
+      vulnerability: true
+    storage:
+      timeline_keep: 30
+
 # Prompt 文件路径
 prompts:
   persona: ./prompts/persona.yaml
