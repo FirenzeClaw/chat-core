@@ -494,6 +494,8 @@ class TurnManager:
             inner_thoughts=inner_thoughts,
             memories=memories,
             user_message=user_message,
+            meta_overrides=self._meta_overrides,  # Spec 006
+            turn_counter=self._turn_counter,
         )
 
     # ── 异步审查 + 决策 (T005) ───────────────────────────────
@@ -545,6 +547,8 @@ class TurnManager:
                         self._emotion_engine.is_vulnerable
                         if self._emotion_engine else False
                     ),
+                    meta_overrides=self._meta_overrides,  # Spec 006
+                    turn_counter=self._turn_counter,
                 )
                 if defense.defense_type != DefenseType.DIRECT:
                     await self._apply_defense(defense, review, replies)
