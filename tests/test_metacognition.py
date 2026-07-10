@@ -222,3 +222,88 @@ class TestMetacognitionEngineTriggers:
         engine.check_triggers(2, DecisionType.CORRECT, False, None)
         assert engine.check_triggers(3, None, False, None) is False
         assert engine._review_streak_counter == 0
+
+
+# ── Spec 006: 集成场景测试 ────────────────────────────────
+
+class TestMetacognitionContext:
+    """build_context() 测试"""
+
+    def test_build_context_basic(self):
+        engine = MetacognitionEngine()
+        ctx = engine.build_context(
+            turn_summaries=[{"turn": "turn_001", "topic": "游戏"}],
+            compound_trends={"gratification": [0.2, 0.1, 0.05]},
+            defense_mode_summary={"activation_rate": 0.4, "main_types": "DENIAL (50%)"},
+            memory_system_state={"avg_recall_count": 3.8, "empty_recall_count": 1, "decay_warning_count": 3, "deep_memory_count": 12},
+            attention_state="drifting",
+            energy_state={"energy": 0.41},
+            subjective_time={"speed_factor": 0.65},
+            vulnerability_history={"is_vulnerable": False, "cooldown_remaining": 0},
+        )
+        assert "最近 N 轮" in ctx
+        assert "复合情绪趋势" in ctx
+        assert "gratification" in ctx
+        assert "防御模式总结" in ctx
+        assert "记忆系统状态" in ctx
+        assert "drifting" in ctx
+        assert "0.41" in ctx
+        assert "脆弱历史" in ctx
+
+    def test_build_context_minimal(self):
+        engine = MetacognitionEngine()
+        ctx = engine.build_context(
+            turn_summaries=[],
+            compound_trends={},
+            defense_mode_summary={},
+            memory_system_state={},
+            attention_state="",
+        )
+        assert "最近" in ctx or ctx.strip() == ""  # 至少没有崩溃
+
+
+class TestIntegrationScenarios:
+    """端到端场景测试"""
+
+    def test_confidence_below_threshold_no_override(self):
+        """confidence < 0.6 → insight_text 可用但 param_overrides 不应用"""
+        ov = MetaParamOverrides()
+        param_ov = MetaParamOverrides()
+        param_ov.review_threshold_offset = 0.1
+        param_ov._review_threshold_set = True
+        report = MetacognitionReport(
+            insight_text="I noticed something",
+            confidence=0.5,
+            param_overrides=param_ov,
+        )
+        ov.apply(report, turn_counter=5)
+        assert ov.review_threshold_offset == 0.0  # 未应用
+        assert report.insight_text == "I noticed something"
+
+    def test_full_override_lifecycle(self):
+        """完整生命周期：apply → 有效期 → 过期"""
+        ov = MetaParamOverrides()
+        param_ov = MetaParamOverrides()
+        param_ov.review_threshold_offset = 0.1
+        param_ov._review_threshold_set = True
+        param_ov.defense_prob_multiplier = 0.7
+        param_ov._defense_prob_set = True
+        report = MetacognitionReport(
+            insight_text="pattern detected",
+            confidence=0.8,
+            param_overrides=param_ov,
+        )
+        ov.apply(report, turn_counter=10)
+        assert ov.get_review_threshold(0.5, 11) == 0.6  # turn 11, valid
+        assert ov.get_review_threshold(0.5, 14) == 0.6  # turn 14, still valid
+        assert ov.get_review_threshold(0.5, 15) == 0.5  # turn 15, expired
+
+    def test_compound_trend_provided_by_emotion_engine(self):
+        """验证 get_compound_trend 接口约定"""
+        from chat_core.systems.emotion import EmotionEngine, COMPOUND_DIMS
+        engine = EmotionEngine()
+        trends = engine.get_compound_trend("sub")
+        assert isinstance(trends, dict)
+        for dim in COMPOUND_DIMS:
+            assert dim in trends
+            assert isinstance(trends[dim], list)
