@@ -61,8 +61,9 @@ class ModelProvider:
             kwargs["temperature"] = temperature
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
-        if reasoning_effort is not None:
+        if reasoning_effort is not None and reasoning_effort != "":
             kwargs["reasoning_effort"] = reasoning_effort
+            kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
 
         resp = await self._client.chat.completions.create(**kwargs)
         choice = resp.choices[0] if resp.choices else None
@@ -73,6 +74,11 @@ class ModelProvider:
             usage.prompt_tokens = resp.usage.prompt_tokens or 0
             usage.completion_tokens = resp.usage.completion_tokens or 0
             usage.total_tokens = resp.usage.total_tokens or 0
+
+        # DeepSeek reasoning_content: 非流式调用也必须提取并回传
+        reasoning_content: str | None = None
+        if msg:
+            reasoning_content = getattr(msg, "reasoning_content", None)
 
         tool_calls: list[ToolCall] = []
         if msg and msg.tool_calls:
@@ -90,6 +96,7 @@ class ModelProvider:
             content=msg.content if msg else "",
             tool_calls=tool_calls,
             usage=usage,
+            reasoning_content=reasoning_content,
         )
 
     # ── 流式 ────────────────────────────────────────────────
@@ -117,8 +124,9 @@ class ModelProvider:
             kwargs["temperature"] = temperature
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
-        if reasoning_effort is not None:
+        if reasoning_effort is not None and reasoning_effort != "":
             kwargs["reasoning_effort"] = reasoning_effort
+            kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
 
         try:
             stream = await self._client.chat.completions.create(**kwargs)

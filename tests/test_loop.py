@@ -147,17 +147,20 @@ class TestReActLoopTools:
     async def test_send_reply_appends(self):
         loop = ReActLoop(make_provider(), make_tool_registry(), "prompt")
         result = await _handle_send_reply({"text": "Hello, world!"}, loop)
-        data = json.loads(result)
-        assert data["sent"] is True
+        # 自然语言返回，非 JSON
+        assert isinstance(result, str) and len(result) > 0
         assert loop._replies == ["Hello, world!"]
 
     @pytest.mark.asyncio
     async def test_send_reply_truncation(self):
         loop = ReActLoop(make_provider(), make_tool_registry(), "prompt")
-        long_text = "x" * 600  # > 500 default max
-        result = await _handle_send_reply({"text": long_text}, loop)
-        data = json.loads(result)
-        assert data["sent"] is True
+        long_text = "x" * 600  # > 500 hard max
+        # 第一次: 超过150软限制 → 提示不发送
+        result1 = await _handle_send_reply({"text": long_text}, loop)
+        assert "字太多了" in result1
+        assert len(loop._replies) == 0
+        # 第二次重试: 硬截断至500, 发送
+        result2 = await _handle_send_reply({"text": long_text}, loop)
         assert len(loop._replies[0]) == 500
         assert loop._replies[0] == "x" * 500
 
@@ -378,3 +381,75 @@ class TestSubRecallIsolation:
             assert "count" in data
         finally:
             await real_store.close()
+
+
+# ── 注意力注入 + recall→注意力回调 ──────────────────────────────
+
+from chat_core.systems.attention import AttentionModel
+
+
+class TestAttentionInjection:
+    """子Session focus 注入 + recall→注意力回调"""
+
+    def test_init_messages_injects_focus_prompt(self):
+        """_init_messages 应在 system prompt 后注入注意力状态提示"""
+        from chat_core.core.loop import ReActLoop, SubSessionConfig
+        from chat_core.core.tools import ToolRegistry
+
+        mock_provider = MagicMock()  # 不依赖真实 API
+        tools = ToolRegistry()
+        attn = AttentionModel()
+        loop = ReActLoop(
+            provider=mock_provider,
+            tool_registry=tools,
+            system_prompt="你是小深。",
+            config=SubSessionConfig(max_iter=1),
+            attention_model=attn,
+        )
+        loop._init_messages("你好")
+        all_system = [m.content for m in loop._messages if m.role == "system"]
+        attention_hints = [s for s in all_system if "[注意状态]" in s]
+        assert len(attention_hints) >= 1, f"未找到 [注意状态] 提示: {all_system}"
+
+    @pytest.mark.asyncio
+    async def test_recall_hit_triggers_attention_boost(self):
+        """_handle_recall 命中高 salience → apply_event(MEMORY_STRONG_HIT)"""
+        from chat_core.core.loop import _handle_recall
+        from chat_core.core.types import AttentionEvent, ChainedMemory, MemoryEntry
+
+        attn = AttentionModel()
+        attn._states["sub"].focus = 0.80
+
+        mock_store = AsyncMock()
+        mock_store.search_chained = AsyncMock(return_value=[
+            ChainedMemory(
+                entry=MemoryEntry(salience=8.0, key="test", namespace="test/ns"),
+                chain_level=0, chain_parent_key=None, relevance_score=1.0,
+            ),
+        ])
+        mock_store._format_recall_result = MagicMock(return_value="测试回溯")
+
+        await _handle_recall(
+            {"query": "测试"}, mock_store,
+            chain_config=MagicMock(), attention_model=attn,
+        )
+        assert attn.get_focus("sub") > 0.80, \
+            f"应提升 focus: 0.80 → {attn.get_focus('sub')}"
+
+    @pytest.mark.asyncio
+    async def test_recall_empty_triggers_attention_penalty(self):
+        """_handle_recall 空结果 → apply_event(MEMORY_MISS)"""
+        from chat_core.core.loop import _handle_recall
+
+        attn = AttentionModel()
+        attn._states["sub"].focus = 0.50
+
+        mock_store = AsyncMock()
+        mock_store.search = AsyncMock(return_value=[])
+
+        await _handle_recall(
+            {"query": "不存在"}, mock_store,
+            chain_config=None, attention_model=attn,
+        )
+        assert attn.get_focus("sub") < 0.50, \
+            f"空结果应降低 focus: 0.50 → {attn.get_focus('sub')}"

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import time
 from datetime import datetime
 from typing import Any, Callable
@@ -15,6 +16,7 @@ from chat_core.core.provider import ModelProvider
 from chat_core.core.prompt_engine import PromptEngine
 from chat_core.core.tools import ToolDefinition, ToolRegistry
 from chat_core.core.types import (
+    AttentionStateEnum,
     CorrectionCmd,
     Intent,
     IntentStatus,
@@ -98,13 +100,54 @@ class ProactiveSystem:
 
     # ── Phase 7: 无聊触发 → 主动行为 (T055-T056) ────────────
 
+    def _should_initiate(self) -> bool:
+        """检查是否应主动发起对话（注意力状态感知）。
+
+        - FOCUSED:  允许主动发起（正常概率）
+        - DRIFTING: 允许但概率 ×0.3
+        - DULL:     禁止主动发起（概率 0.0）
+
+        Returns:
+            True 表示可以主动发起
+        """
+        if self._attention_model is not None:
+            try:
+                state = self._attention_model.get_state_enum("sub")
+                if state == AttentionStateEnum.DULL:
+                    return False
+                elif state == AttentionStateEnum.DRIFTING:
+                    if random.random() > 0.3:
+                        return False
+            except Exception:
+                pass
+        return True  # FOCUSED 或无注意力模型时正常概率
+
     async def _on_boredom_trigger(self, boredom: float) -> None:
         """无聊触发回调：检查兴趣权重，决定是否主动发起对话。
 
         如果兴趣权重 > 0.5：创建 ActionBrain 搜索兴趣话题，
         双脑评估结果，有意义的写入潜意识/nudges，然后触发主动发言。
         如果兴趣权重 ≤ 0.5：直接写 nudge 到潜意识，触发主动发言。
+
+        DULL 态特殊处理：不发起对话，仅写入 subconscious/nudges。
         """
+        # DULL 态 + 无聊 → 不发起对话，写 nudges 等恢复后处理
+        if self._attention_model is not None:
+            try:
+                if self._attention_model.get_state_enum("sub") == AttentionStateEnum.DULL:
+                    await self._memory.save(MemoryEntry(
+                        namespace="subconscious/nudges",
+                        key=f"dull_boredom_{int(time.time())}",
+                        value={
+                            "source": "dull_boredom",
+                            "boredom_level": boredom,
+                            "note": "注意力昏沉，等恢复后再主动发起",
+                        },
+                    ))
+                    return
+            except Exception:
+                pass
+
         top_interests = self._interest_model.get_top_interests(3)
         interest_weight = top_interests[0][1] if top_interests else 0.0
 

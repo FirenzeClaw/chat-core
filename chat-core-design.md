@@ -15,42 +15,57 @@ chat-core 是一个独立运行的终端 AI 聊天 CLI。不依赖 Kimi Code CLI
 
 ## 二、大脑分工
 
-### 2.1 四脑模型
+### 2.1 多脑模型
 
 ```
-┌───────────────┐  ┌───────────────┐  ┌───────────┐  ┌──────────┐
-│  逻辑主脑      │  │  情感主脑      │  │ 子Session  │  │ 行为脑   │
-│  Logic Keeper │  │  Emotion Tagger│  │  Speaker   │  │  Action  │
-├───────────────┤  ├───────────────┤  ├───────────┤  ├──────────┤
-│ recall(事实)  │  │ recall(情感)  │  │ send_reply │  │ search   │
-│ 方向判断      │  │ 方向判断      │  │ wait       │  │ recall   │
-│ 解析内心戏    │  │ 打标签        │  │ inner_     │  │ web_fetch│
-│ 结构化归档    │  │ 情感归档      │  │   thoughts │  │          │
-│ 事实审查      │  │ 语气审查      │  │ recall     │  │          │
-│ 纠错权重      │  │ 情感权重      │  │ (只读)     │  │          │
-│ 评估→无聊     │  │ 兴趣→无聊     │  │            │  │          │
-├───────────────┤  ├───────────────┤  ├───────────┤  ├──────────┤
-│ 说话: ❌      │  │ 说话: ❌      │  │ 说话: ✅   │  │ 说话: ❌ │
-│ 写记忆: ✅    │  │ 写记忆: ✅    │  │ 写记忆: ❌ │  │ 写记忆:❌│
-│ 决策: ✅      │  │ 决策: ✅      │  │ 决策: ❌   │  │ 决策: ❌ │
-└───────────────┘  └───────────────┘  └───────────┘  └──────────┘
+┌───────────────┐  ┌───────────────┐  ┌───────────────┐  ┌──────────┐
+│  逻辑主脑      │  │  情感主脑      │  │ 子Session × N  │  │ 行为脑   │
+│  Logic Keeper │  │  Emotion Tagger│  │  Speakers      │  │  Action  │
+├───────────────┤  ├───────────────┤  ├───────────────┤  ├──────────┤
+│ recall(事实)  │  │ recall(情感)  │  │ send_reply     │  │ search   │
+│ 方向判断      │  │ 方向判断      │  │ wait           │  │ recall   │
+│ 解析内心戏    │  │ 打标签        │  │ inner_thoughts │  │ web_fetch│
+│ 结构化归档    │  │ 情感归档      │  │ recall(只读)   │  │          │
+│ 事实审查(异步)│  │ 语气审查(异步)│  │ done           │  │          │
+│ 纠错权重协商  │  │ 纠错权重协商  │  │                │  │          │
+│ 评估→无聊     │  │ 兴趣→无聊     │  │                │  │          │
+├───────────────┤  ├───────────────┤  ├───────────────┤  ├──────────┤
+│ 说话: ❌      │  │ 说话: ❌      │  │ 说话: ✅       │  │ 说话: ❌ │
+│ 写记忆: ✅    │  │ 写记忆: ✅    │  │ 写记忆: ❌     │  │ 写记忆:❌│
+│ 决策: ✅      │  │ 决策: ✅      │  │ 决策: ❌       │  │ 决策: ❌ │
+└───────────────┘  └───────────────┘  └───────────────┘  └──────────┘
 ```
 
-**核心原则**：主脑不发言。子Session 是唯一的嘴。
+**核心原则**：主脑不发言。子Session 是唯一的嘴，可以有多个（多副脑）。行为脑无情感状态。
 
 ### 2.2 各脑工具集
 
-**逻辑主脑**：`recall`, `memory_save`, `memory_link`, `inject_to_sub`, `review_sub`, `write_correction`
+**逻辑主脑**：`recall`, `memory_save`, `memory_link`, `inject_to_sub`, `write_correction`
 
-**情感主脑**：`recall`, `memory_tag`, `inject_to_sub`, `review_sub`, `write_correction`
+**情感主脑**：`recall`, `memory_tag`, `inject_to_sub`, `write_correction`
 
-**子Session**：`send_reply`, `wait`, `recall`(只读), `inner_thoughts`(纯文本), `done`
+**子Session（每个实例）**：`send_reply`, `wait`, `recall`(只读), `inner_thoughts`(纯文本), `done`
 
 **行为脑**：`search`, `recall`, `web_fetch`（无 `send_reply`）
+
+### 2.3 子Session 数量
+
+主脑根据对话复杂度决定激活几个子Session：
+
+| 场景 | 数量 | 分工 |
+|------|:---:|------|
+| 简单应答 | 1 | 主发言人 |
+| 情感对话 | 2 | 主发言人 + 语气调节者 |
+| 信息密集型 | 2 | 主发言人 + 信息补充者 |
+| 复杂/冲突 | 3 | 主发言人 + 调节者 + 补充者 |
+
+多个子Session 的 `send_reply` 按时间戳交错输出到 CLI，标注来源（如 `[夏柠]` vs 无标注以保持人格统一）。
 
 ---
 
 ## 三、一个 Turn 的完整流程
+
+**核心原则**：主脑审查**不阻塞**子Session 的消息发送。子Session 发送→用户立即看到。主脑异步审查→发现错误→通过潜意识区在**下一轮**注入纠正。
 
 ### 3.1 消息到达 → 双脑并行检索
 
@@ -58,41 +73,54 @@ chat-core 是一个独立运行的终端 AI 聊天 CLI。不依赖 Kimi Code CLI
 用户消息 → 
   逻辑主脑: recall("关键词") → 事实记忆
   情感主脑: recall("情感词") → 情感关联
-→ 各自方向判断 → 合并注入子Session
+→ 各自方向判断 → 通过消息总线交换 (见 11.5) → 合并注入子Session
 ```
 
-### 3.2 子Session ReAct 循环
+### 3.2 子Session ReAct 循环（可多个并行）
 
 ```
-收到注入 → while _should_continue():
+每个子Session 收到各自注入 → while _should_continue():
   ① 读短期记忆 (近3轮行为脑结果)
-  ② 匹配潜意识区 (corrections/nudges)
+  ② 匹配潜意识区 (corrections/nudges — 主脑在上一轮写入的)
   ③ _think() → LLM function calling
-  ④ _act() → 执行工具
+  ④ _act() → send_reply 立即输出到 CLI, 不等待审查
   ⑤ 工具结果注入上下文 → 回到 ①
 → inner_thoughts (纯文本)
+→ done
 ```
+
+**关键**: 用户看到子Session 的第一条 `send_reply` 时，主脑的审查可能还没开始。消息流式到达，不被阻塞。
 
 **终止条件**：`done` | hit_count ≥ max_iter | sadness > 0.8 | focus < 0.15 | boredom > 0.7
 
-### 3.3 双脑审查 + 权重决策
+### 3.3 双脑异步审查 + 权重协商
 
 ```
-子Session 完成 →
-  逻辑主脑: 事实审查 + 解析内心戏 + 结构化归档
-  情感主脑: 语气审查 + 打标签 + 情感归档
+子Session 完成 → TurnManager 收到 inner_thoughts:
 
-错误发现 → compute_weight():
-  combined = logic_weight × 0.6 + emotion_weight × 0.4
+  [异步启动 — 不阻塞用户下一轮消息]
+  
+  ┌─ 逻辑主脑 ──────────────────┐  ┌─ 情感主脑 ──────────────────┐
+  │ 事实审查 + 解析内心戏         │  │ 语气审查 + 打标签            │
+  │ memory.save (结构化归档)      │  │ memory_tag (情感标签)        │
+  │                              │  │                              │
+  └──────────┬───────────────────┘  └──────────┬───────────────────┘
+             │                                 │
+             └──── 消息总线交换审查结论 ────────┘
+                           │
+                    联合协商权重:
+                    combined = logic_weight × 0.5 + emotion_weight × 0.5
 ```
 
-### 3.4 权重分流
+### 3.4 权重分流（延迟生效）
 
-| 条件 | 行动 |
-|------|------|
-| logic > 0.8 AND emotion < 0.3 | 拧巴：按逻辑执行，记录情感不适 |
-| combined > 0.5 | 写潜意识区 → 注入子Session → 纠正发言 |
-| combined ≤ 0.5 | 沉默归档 → "我知道但选择没说" |
+| 条件 | 行动 | 何时生效 |
+|------|------|------|
+| logic > 0.8 AND emotion < 0.3 | 拧巴：记录情感不适，执行逻辑 | 写入 subconscious |
+| combined > 0.5 | 写潜意识区 → 下轮注入自动触发纠正 | **下一轮** |
+| combined ≤ 0.5 | 沉默归档 → "我知道但选择没说" | 仅归档 |
+
+**关键设计**：纠正永远不打断当前轮。它写在潜意识区，等**下一轮**子Session think 时自动匹配并触发纠正。这模拟了"我刚才想了想，其实..."的人类对话节奏。
 
 ---
 
@@ -155,6 +183,7 @@ global/
 
 ```
 10维 × 3脑 (主脑逻辑/主脑情感/子Session)
+(行为脑无状态，不参与情绪系统)
 各维度独立衰减半衰期 (30s ~ 3600s)
 脑间传染 (contagion_strength = 0.1)
 个性调制: 外显情绪 = 真实情绪 × 人格过滤器
@@ -220,7 +249,7 @@ FuzzyParam 模糊化采样:
 | no_error | 0.0 | minor_tone | 0.3 |
 
 ```
-combined = logic_weight × 0.6 + emotion_weight × 0.4
+combined = logic_weight × 0.5 + emotion_weight × 0.5
 阈值: 0.5
 ```
 
@@ -374,27 +403,20 @@ inner_thoughts 只能在发言全部结束后调用一次。
 
 ### 11.2 主脑的 _think() 循环
 
-**问题**：主脑没有定义思考流程。
-
-**方案**：主脑也是 ReAct 循环，但是**单 pass 模式**（不允许多轮）：
+**方案**：主脑分为两个阶段（详见 12.1），总计 ~2 次 LLM 调用。
 
 ```
-逻辑主脑._think() 循环:
-  ① _think() → LLM function calling
-     可用工具: recall, memory_save, memory_link, inject_to_sub
-     不可用: send_reply, inner_thoughts
-  
-  ② 模型输出 tool_call → 执行 → 结果注入上下文
-  
-  ③ 模型输出 final_text (非 tool_call 的纯文本):
-     → 这是"方向判断", 被解析为 injection context
-  
-  ④ 单轮结束 (不是多轮 think-act-think)
+逻辑主脑 Phase 1 (recall + 方向判断):
+  _think() → LLM function calling
+  可用工具: recall, memory_link
+  → 模型调用 recall → 获取记忆
+  → 模型输出方向判断文本
 
-情感主脑同理，但工具集为: recall, memory_tag, inject_to_sub
+逻辑主脑 Phase 2 (注入):
+  _think() → LLM function calling (上下文含 Phase 1 结果)
+  可用工具: inject_to_sub
+  → 模型调用 inject_to_sub → 注入完成
 ```
-
-**关键**：主脑不做多轮循环。一次 LLM 调用 = recall + 判断 + 注入。追求速度。
 
 ### 11.3 错误检测机制
 
@@ -423,26 +445,36 @@ Layer 3: LLM 审查 (仅在 Layer 1 发现候选 且 Layer 2 无记录时)
 
 **问题**：四脑 + tick 的并发关系未定义。
 
-**方案**：
+**方案**：异步非阻塞，审查在后台运行。
 
 ```
 并发规则:
-  ┌─ 同一时刻最多 1 个 子Session 在运行 (串行: 用户的嘴只有一张)
-  ├─ 主脑审查时，阻塞子Session (等审查完才能接收新消息)
-  ├─ 行为脑与子Session 可并行 (行为脑结果进短期记忆，不打断子Session)
+  ┌─ 子Session 发送消息 = 立即输出到 CLI (不等待任何人)
+  ├─ 同一时刻最多 3 个子Session 并行发言 (Semaphore(3))
+  ├─ 主脑审查在子Session 完成后异步启动 (不阻塞子Session)
+  ├─ 审查期间的纠正 → 写入潜意识区 → 下一轮子Session think 自动读取
+  ├─ 行为脑与子Session 可并行 (行为脑结果进短期记忆)
   ├─ 行为脑上限 2 个并发 (Semaphore(2))
   ├─ 用户新消息到达时:
-  │   若子Session 正在运行 → 排队 (不打断)
-  │   若主脑正在审查 → 等审查完成
-  ├─ idle tick 仅在全局 idle 状态触发 (不在活跃对话中触发)
-  └─ 双主脑之间可并行 (各自的 recall 互不依赖)
+  │   若子Session 正在运行 → 排队 (不打断当前发言)
+  │   若主脑正在审查 → 不等待 (审查是异步的，不影响)
+  ├─ idle tick 仅在全局 idle 状态触发
+  └─ 双主脑之间可并行 (各自的 recall/phases 互不依赖)
+
+时序示意:
+  用户消息
+    → 主脑 Phase 1+2 (recall + inject) [~2s]
+    → 子Session ReAct [~3s, 消息流式输出]
+        ├── send_reply(1) → CLI 立即显示 ← 用户开始阅读
+        ├── send_reply(2) → CLI 立即显示
+        └── send_reply(3) → CLI 立即显示 → inner_thoughts → done
+    → 主脑异步审查 [~1s, 后台运行, 不阻塞]
+        └── 写 subconscious → 下一轮生效
 ```
 
 ### 11.5 双脑相互启发
 
-**问题**："逻辑⇄情感"的交换机制未落地。
-
-**方案**：通过内部消息总线，三个交换窗口：
+**方案**：通过内部消息总线，三个交换窗口 + 一个持续通道：
 
 ```
 交换窗口 1: recall 完成后 (双脑交换各自检索到的记忆)
@@ -453,12 +485,19 @@ Layer 3: LLM 审查 (仅在 Layer 1 发现候选 且 Layer 2 无记录时)
 交换窗口 2: 审查完成后 (双脑交换各自的审查结论)
   逻辑主脑 → bus.publish("logic_review", {errors: [...], corrections: [...]})
   情感主脑 → bus.publish("emotion_review", {tone_issues: [...], tags: [...]})
-  用于联合权重计算
+  用于联合协商权重
 
 交换窗口 3: 空闲 tick 时 (双脑交换各自的主动发起想法)
   逻辑主脑 → bus.publish("logic_inspiration", {topic_ideas: [...]})
   情感主脑 → bus.publish("emotion_inspiration", {mood_read: "...", suggestion: "..."})
   用于合并启发
+
+持续通道: 情感→逻辑的实时情绪通知
+  情感主脑在用户消息分析后, 若检测到显著情绪变化:
+    bus.publish("emotion_alert", {mood_shift: "happy→sad", intensity: 0.7})
+  逻辑主脑收到后, 在 Phase 2 注入时调整方向:
+    "用户情绪急转直下, 当前方向需要更谨慎"
+  (不需要等待审查窗口 — 实时调整)
 ```
 
 ### 11.6 意图提取
@@ -832,34 +871,41 @@ memory_tag (情感主脑):   给已有 entry 追加情感标签
 
 ### 12.3 纠正循环（Gap 6-7）
 
-**Gap 6: 纠正递归防护**
+**Gap 6: 纠正不是单次模式，是完整的子Session 发言**
 
 ```
 纠正发言的子Session:
-  ┌─ 单次纠正模式 (不是完整的 ReAct 循环)
-  ├─ 工具: recall(只读subconscious), send_reply(最多1次), done
-  ├─ 没有 inner_thoughts (纠正不需要内心戏)
-  ├─ 没有 wait (纠正不拖沓)
-  ├─ 主脑收到纠正结果后:
-  │   ✅ 如果 send_reply 被调用 → 审查纠正内容 → 记录 → 结束
-  │   ❌ 不触发新的纠正循环 (防止无限递归)
-  └─ max_iter = 2 (recall + send_reply 各一次即可)
+  ┌─ 完整子Session 能力 (和正常发言一样)
+  ├─ 工具: send_reply, wait, recall(只读subconscious), inner_thoughts, done
+  ├─ 触发: 下一轮子Session think 时自动匹配到 subconscious/corrections
+  ├─ 流程: think → read subconscious → "啊等等, 我记得是..." → send_reply → wait
+  │        → "上次听你说的" → send_reply → inner_thoughts → done
+  ├─ inner_thoughts 存在 (归档纠正的内心戏, 如 "纠正了身份信息，语气自然")
+  ├─ 纠正的 send_reply 也可以多段 (像正常说话一样自然)
+  │
+  ├─ 递归防护:
+  │   纠正发言产生的 inner_thoughts 被审查时:
+  │   ✅ 如果纠正正确 → 记录 → 结束
+  │   ❌ 如果纠正本身又错了 → 再次写入 subconscious
+  │      → 但标记 recursion_depth += 1
+  │      → depth > 2 → 不再纠正 (放弃, 记录 "纠正失败")
+  └─ 最多递归 2 层
 ```
 
 **Gap 7: 拧巴记录明确归属**
 
 ```
-TurnManager 在 review 完成后统一处理:
+TurnManager 在异步审查完成后统一处理:
 
   if logic_weight > 0.8 and emotion_weight < 0.3:
-      ① 执行逻辑的纠正决策
-      ② TurnManager 写入拧巴记录 (不委托给任何脑):
+      ① 写入 subconscious/corrections (按逻辑执行纠正)
+      ② TurnManager 写入拧巴记录:
          memory.save("self/feelings/twisted", f"twisted_{turn_id}", {
              "context": "纠正 vs 沉默分歧",
-             "logic_decision": "纠正",
-             "emotion_dissent": "觉得不该说",
-             "resolution": "按逻辑执行",
-             "emotion_aftermath": "轻微不适",
+             "logic_decision": "纠正 (将写入 subconscious)",
+             "emotion_dissent": "觉得不该说 (weight: 0.2)",
+             "resolution": "按逻辑执行。下一轮子Session 会自动触发纠正。",
+             "emotion_aftermath": "轻微不适，记住了",
          })
 ```
 

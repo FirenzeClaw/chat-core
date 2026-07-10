@@ -1,4 +1,4 @@
-"""BoredomDetector — 无聊检测器：对话结束后启动 ticker，指数衰减触发主动行为 (Phase 7, T053)"""
+"""BoredomDetector — 无聊检测器：对话结束后启动 ticker，指数衰减触发主动行为 (Phase 7, T053 + 注意力状态机 §5 联动)"""
 
 from __future__ import annotations
 
@@ -6,6 +6,8 @@ import asyncio
 import math
 import time
 from typing import Any
+
+from chat_core.config import get_config
 
 
 class BoredomDetector:
@@ -16,23 +18,35 @@ class BoredomDetector:
     - t 为对话结束后的经过时间（秒）
     - 随着时间推移无聊水平逐渐升高（参与感逐渐消退）
 
-    触发阈值:
-    - boredom > 0.70 → emit boredom_trigger: 无聊水平过高，需要主动发起
+    触发阈值（注意力状态感知）:
+    - 默认 (FOCUSED/DRIFTING): boredom > 0.70 → 主动发起
+    - DULL 态: boredom > threshold_dull (0.40) → 更易触发
     - boredom > 0.90 AND impulsiveness > 0.5 → 结束当前主动对话
+
+    Tick 间隔（注意力状态感知）:
+    - FOCUSED: 30s / DRIFTING: 20s / DULL: 15s (加速 2×)
     """
 
     # 可配置参数
-    DEFAULT_TICK_INTERVAL = 30       # 秒
+    DEFAULT_TICK_INTERVAL = 30       # 秒 (fallback)
     DEFAULT_DECAY_HALFLIFE = 600     # e 折半衰期（秒）
-    TRIGGER_THRESHOLD = 0.70         # 无聊触发阈值
+    TRIGGER_THRESHOLD = 0.70         # 默认无聊触发阈值
     END_CONVERSATION_THRESHOLD = 0.90  # 结束对话阈值
 
-    def __init__(self) -> None:
+    def __init__(self, attention_model: Any = None, subjective_clock: Any = None,
+                 energy_bar: Any = None) -> None:
         self._eval_param: float = 0.0
         self._interest_weight: float = 0.0
         self._start_time: float = 0.0
         self._active: bool = False
         self._impulsiveness: float = 0.0
+
+        # 注意力状态机联动（可选，向后兼容）
+        self._attention_model = attention_model
+
+        # Spec 007: 主观时钟 + 精力条（可选，向后兼容）
+        self._subjective_clock = subjective_clock
+        self._energy_bar = energy_bar
 
         # 后台 tick 控制
         self._task: asyncio.Task[None] | None = None
@@ -105,19 +119,68 @@ class BoredomDetector:
         decay = math.exp(-elapsed / self.DEFAULT_DECAY_HALFLIFE)
         return 1.0 - self._eval_param * decay
 
+    # ── 注意力状态感知 ──────────────────────────────────────────
+
+    def _get_tick_interval(self) -> float:
+        """根据注意力状态返回 tick 间隔。
+
+        FOCUSED: 30s / DRIFTING: 20s / DULL: 15s
+        从 config.yaml 的 boredom_link 段读取。
+        """
+        cfg = get_config()
+        bl = cfg.attention_config().get("boredom_link", {})
+        if self._attention_model is not None:
+            try:
+                from chat_core.core.types import AttentionStateEnum
+                state = self._attention_model.get_state_enum("sub")
+                if state == AttentionStateEnum.FOCUSED:
+                    return float(bl.get("tick_interval_focused", self.DEFAULT_TICK_INTERVAL))
+                elif state == AttentionStateEnum.DRIFTING:
+                    return float(bl.get("tick_interval_drifting", 20))
+                else:  # DULL
+                    return float(bl.get("tick_interval_dull", 15))
+            except Exception:
+                pass
+        return float(bl.get("tick_interval_focused", self.DEFAULT_TICK_INTERVAL))
+
+    def _get_trigger_threshold(self) -> float:
+        """获取无聊触发阈值。
+
+        DULL 态降低阈值 (0.40)，更容易触发。
+        """
+        if self._attention_model is not None:
+            try:
+                from chat_core.core.types import AttentionStateEnum
+                if self._attention_model.get_state_enum("sub") == AttentionStateEnum.DULL:
+                    bl = get_config().attention_config().get("boredom_link", {})
+                    return float(bl.get("threshold_dull", 0.40))
+            except Exception:
+                pass
+        return self.TRIGGER_THRESHOLD
+
     # ── 后台 tick 循环 ────────────────────────────────────────
 
     async def _tick_loop(self) -> None:
-        """后台 tick 循环，每 tick_interval 秒检查一次"""
+        """后台 tick 循环，每状态感知间隔检查一次"""
         while self._stop_event and not self._stop_event.is_set():
             self._check_thresholds()
             try:
+                interval = self._get_tick_interval()
                 await asyncio.wait_for(
                     self._stop_event.wait(),
-                    timeout=self.DEFAULT_TICK_INTERVAL,
+                    timeout=interval,
                 )
             except asyncio.TimeoutError:
                 pass  # 正常超时，继续检查
+            # Spec 007: 主观时间采样 + 精力恢复
+            if self._subjective_clock and self._attention_model:
+                try:
+                    attn_state = self._attention_model.get_state_enum("sub")
+                    self._subjective_clock.tick(interval, attention_state_enum=attn_state)
+                except Exception:
+                    pass  # 静默降级
+            if self._energy_bar:
+                self._energy_bar.recover(interval)
 
     def _check_thresholds(self) -> None:
         """检查无聊水平是否触发阈值"""
@@ -125,6 +188,7 @@ class BoredomDetector:
             return
 
         boredom = self.get_boredom()
+        trigger_threshold = self._get_trigger_threshold()
 
         # 结束对话阈值：极度无聊 + 冲动 → 结束当前主动对话
         if boredom > self.END_CONVERSATION_THRESHOLD and self._impulsiveness > 0.5:
@@ -132,7 +196,7 @@ class BoredomDetector:
                 asyncio.create_task(self._on_end_conversation(boredom))
 
         # 触发阈值：无聊过高 → 需要主动发起
-        elif boredom > self.TRIGGER_THRESHOLD:
+        elif boredom > trigger_threshold:
             if self._on_trigger:
                 # 不能直接 await，用 create_task 调度
                 asyncio.create_task(self._on_trigger(boredom))

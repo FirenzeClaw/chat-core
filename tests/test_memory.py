@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from datetime import datetime, timedelta
 
 import pytest
@@ -922,5 +923,107 @@ class TestDecay:
             assert isinstance(result["boosted_count"], int)
             assert result["expired_count"] >= 3
             assert result["boosted_count"] >= 1
+        finally:
+            await store.close()
+
+
+# ── Spec 003 §12: 幂律衰减测试 ──────────────────────────────
+
+class TestPowerLawDecay:
+    """§12 幂律衰减: effective_salience + 双向迁移"""
+
+    def test_effective_salience_standard_curve(self):
+        """salience=5, 90天 → ~4.57 (standard β=0.01)"""
+        now = time.time()
+        created = now - 90 * 86400  # 90 天前
+        result = MemoryStore.effective_salience(5.0, created, now, "standard", 0.01, 0.001, 0.5)
+        assert 4.4 < result < 4.7, f"Expected ~4.57, got {result}"
+
+    def test_effective_salience_deep_curve(self):
+        """salience=5, 90天 → ~4.99 (deep β=0.001, 10× 慢)"""
+        now = time.time()
+        created = now - 90 * 86400
+        result = MemoryStore.effective_salience(5.0, created, now, "deep", 0.01, 0.001, 0.5)
+        assert result > 4.9, f"Expected ~4.99, got {result}"
+
+    def test_effective_salience_recent_no_decay(self):
+        """刚创建 (t≈0) → 几乎不衰减"""
+        now = time.time()
+        created = now - 60  # 1 分钟前
+        result = MemoryStore.effective_salience(5.0, created, now, "standard", 0.01, 0.001, 0.5)
+        assert result > 4.99, f"Expected ~5.0, got {result}"
+
+    def test_effective_salience_config_disabled(self):
+        """decay.enabled=false → 返回原始 salience"""
+        result = MemoryStore.effective_salience(
+            5.0, 0, time.time(), "standard", 0.01, 0.001, 0.5, enabled=False
+        )
+        assert result == 5.0
+
+
+# ── Spec 003 §12: 双向迁移测试 ──────────────────────────────
+
+class TestBidirectionalMigration:
+    """§12.4: 双向迁移 (晋升+降级)"""
+
+    @pytest.mark.asyncio
+    async def test_downgrade_long_to_short(self):
+        """user/* 中 salience < 3 → 迁回 short_term/*"""
+        store = MemoryStore(":memory:")
+        await store.open()
+        try:
+            entry = MemoryEntry(
+                namespace="user/test/downgrade", key="low_salience",
+                value={"fact": "被遗忘的事实"}, salience=2.0,
+                access_count=5, last_access="2026-01-01T00:00:00",
+                created_at=datetime.now(),
+            )
+            await store.save(entry)
+            await store._downgrade_long_to_short()
+            # 应迁移到 short_term
+            short = await store.query("short_term/user/test/downgrade")
+            long = await store.query("user/test/downgrade")
+            assert len(short) == 1
+            assert len(long) == 0
+            # access_count 保留
+            assert short[0].access_count == 5
+        finally:
+            await store.close()
+
+    @pytest.mark.asyncio
+    async def test_hysteresis_no_migration(self):
+        """salience 3-5 之间的条目不迁移 (滞后带)"""
+        store = MemoryStore(":memory:")
+        await store.open()
+        try:
+            entry = MemoryEntry(
+                namespace="user/test/hysteresis", key="mid",
+                value={"fact": "边界值"}, salience=4.0,
+                created_at=datetime.now(),
+            )
+            await store.save(entry)
+            await store._downgrade_long_to_short()
+            # 不应迁移
+            long = await store.query("user/test/hysteresis")
+            assert len(long) == 1
+        finally:
+            await store.close()
+
+    @pytest.mark.asyncio
+    async def test_unmark_deep_fallback(self):
+        """deep 记忆 salience < 5 → decay_curve 变回 'standard'"""
+        store = MemoryStore(":memory:")
+        await store.open()
+        try:
+            entry = MemoryEntry(
+                namespace="user/test/deep_fb", key="fading_deep",
+                value={"fact": "褪色的深刻记忆"}, salience=4.0,
+                decay_curve="deep", created_at=datetime.now(),
+            )
+            await store.save(entry)
+            await store._unmark_deep_memory()
+            result = await store.get("user/test/deep_fb", "fading_deep")
+            assert result is not None
+            assert result.decay_curve == "standard"
         finally:
             await store.close()

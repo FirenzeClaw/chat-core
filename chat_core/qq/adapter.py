@@ -21,7 +21,13 @@ from chat_core.core.loop import ReActLoop, SubSessionConfig, register_sub_sessio
 from chat_core.core.provider import ModelProvider
 from chat_core.core.prompt_engine import PromptEngine
 from chat_core.core.tools import ToolRegistry
-from chat_core.core.types import MemoryEntry, Message, RecallChainConfig, SUB_SESSION_CHAIN_CONFIG
+from chat_core.core.types import (
+    AttentionEvent,
+    MemoryEntry,
+    Message,
+    RecallChainConfig,
+    SUB_SESSION_CHAIN_CONFIG,
+)
 from chat_core.systems.memory import MemoryStore
 from chat_core.systems.emotion import EmotionEngine
 from chat_core.systems.personality import PersonalityEngine
@@ -29,6 +35,8 @@ from chat_core.systems.attention import AttentionModel
 from chat_core.systems.interest import InterestModel
 from chat_core.systems.review import ReviewSystem
 from chat_core.systems.boredom import BoredomDetector
+from chat_core.systems.energy import EnergyBar
+from chat_core.systems.subjective_time import SubjectiveClock
 from chat_core.systems.proactive import ProactiveSystem
 from chat_core.qq.protocol import MessageContext, fetch_user_nickname, send_message
 from chat_core.qq.sessions import SessionManager, UserSession
@@ -98,8 +106,16 @@ class BotAdapter:
         # ReviewSystem
         self._review_system = ReviewSystem(provider, memory_store)
 
-        # BoredomDetector
-        self._boredom_detector = BoredomDetector()
+        # Spec 007: 具身感知 — 精力条 + 主观时钟 (必须在 BoredomDetector 之前)
+        self._energy_bar = EnergyBar()
+        self._subjective_clock = SubjectiveClock()
+
+        # BoredomDetector (Spec 007: subjective_clock + energy_bar 联动)
+        self._boredom_detector = BoredomDetector(
+            attention_model=self._attention_model,
+            subjective_clock=self._subjective_clock,
+            energy_bar=self._energy_bar,
+        )
 
         # ProactiveSystem (FR-19)
         self._proactive = ProactiveSystem(
@@ -150,11 +166,24 @@ class BotAdapter:
         if key not in self._user_locks:
             self._user_locks[key] = asyncio.Lock()
         async with self._user_locks[key]:
+            # 竞态事件 → 注意力状态机：enter 前记录旧值
+            prev_count = self._race_tracker.active_count
             self._race_tracker.enter()
+            new_count = self._race_tracker.active_count
+
+            # 跨阈值检测
+            if prev_count < 3 and new_count >= 3:
+                self._attention_model.apply_event(AttentionEvent.RACE_MILD, brain="sub")
+            if prev_count < 5 and new_count >= 5:
+                self._attention_model.apply_event(AttentionEvent.RACE_SEVERE, brain="sub")
+
             try:
                 return await self._process(ctx, send_fn)
             finally:
                 self._race_tracker.exit()
+                # 竞态缓解 → 注意力 +0.05
+                if self._race_tracker.active_count < prev_count:
+                    self._attention_model.boost("sub", 0.05)
 
     async def _process(self, ctx: MessageContext, send_fn: Any = None) -> list[str]:
         user_session = self._sessions.get_or_create(ctx.user_id, ctx.session_key)
@@ -203,11 +232,16 @@ class BotAdapter:
             return ["[系统提示] 小深暂时无法回复，请稍后再试。"]
 
         # 等待双脑注入完成（如果还没完），保证归档时可取到
-        await inject_task
+        _context, memories = await inject_task
 
         segs = list(loop.replies) if loop.replies else segments
         if not segs:
             return []
+
+        # 异步审查（fire-and-forget，不阻塞归档和后续 turn）
+        asyncio.create_task(
+            self._async_review_and_decide(segs, loop.inner_thoughts, memories, ctx)
+        )
 
         await self._archive(ctx, "\n".join(segs), user_session, loop)
         user_session.turn_counter += 1
@@ -222,6 +256,11 @@ class BotAdapter:
 
         # 对话结束 → 启动无聊检测 (FR-19)
         self._on_conversation_ended()
+
+        # Spec 007: 基础精力消耗
+        if self._energy_bar and segs:
+            compound_delta = self._emotion_engine.last_compound_delta if self._emotion_engine else 0.0
+            self._energy_bar.consume(reply_count=len(segs), compound_delta=compound_delta)
 
         logger.info(
             "Turn 完成: user=%s turn=%d segments=%d",
@@ -255,6 +294,8 @@ class BotAdapter:
             system_prompt=system_prompt,
             config=sub_config,
             attention_model=AttentionModel(),
+            memory_store=self._memory,
+            energy_bar=self._energy_bar,
         )
 
         # Spec 003: 构造子Session 联锁配置
@@ -264,7 +305,7 @@ class BotAdapter:
             max_per_level=SUB_SESSION_CHAIN_CONFIG.max_per_level,
             namespace_prefix=f"user/{user_id}" if user_id else None,
         )
-        register_sub_session_tools(tools, loop, self._memory, chain_config=chain_config)
+        register_sub_session_tools(tools, loop, self._memory, chain_config=chain_config, attention_model=loop._attention_model)
 
         from chat_core.systems.proactive import _enhance_recall
         _enhance_recall(tools, self._memory, self._personality_engine)
@@ -274,15 +315,20 @@ class BotAdapter:
 
     # ── 双主脑 recall ───────────────────────────────────────
 
-    async def _dual_recall(self, user_message: str, ctx: MessageContext) -> str:
-        """全局双主脑：think_pre (recall) + think_inject (tag + context)。"""
+    async def _dual_recall(self, user_message: str, ctx: MessageContext) -> tuple[str, list[MemoryEntry]]:
+        """全局双主脑：think_pre (recall) + think_inject (tag + context)。
+        
+        返回 (context_text, all_memories)，供审查使用。
+        """
         if not self._logic_brain or not self._emotion_brain:
-            return ""
+            return "", []
         try:
             (logic_mem, logic_dir), (emotion_mem, emotion_dir) = await asyncio.gather(
                 self._logic_brain.think_pre(user_message),
                 self._emotion_brain.think_pre(user_message),
             )
+            # 收集所有记忆供审查使用
+            all_memories: list[MemoryEntry] = list(logic_mem or []) + list(emotion_mem or [])
             # Step 2: think_inject — EmotionBrain 在此阶段写入情感标签
             logic_inj, emotion_inj = await asyncio.gather(
                 self._logic_brain.think_inject(user_message, logic_mem, logic_dir),
@@ -292,27 +338,129 @@ class BotAdapter:
             for inj in [logic_inj, emotion_inj]:
                 if isinstance(inj, dict) and inj.get("context"):
                     parts.append(str(inj["context"]))
-            return " | ".join(parts) if parts else f"{logic_dir or ''} {emotion_dir or ''}".strip()
+            context = " | ".join(parts) if parts else f"{logic_dir or ''} {emotion_dir or ''}".strip()
+            return context, all_memories
         except Exception:
             logger.exception("双主脑 recall 失败")
-            return ""
+            return "", []
 
     # ── 异步注入 ──────────────────────────────────────────
 
     async def _inject_async(
         self, loop: ReActLoop, ctx: MessageContext, severity: str,
-    ) -> None:
-        """后台执行双脑 recall + inject，结果注入子 Session 消息历史。"""
+    ) -> tuple[str, list[MemoryEntry]]:
+        """后台执行双脑 recall + inject，结果注入子 Session 消息历史。
+        
+        返回 (context, memories) 供审查使用。
+        """
         try:
-            context = await self._dual_recall(ctx.content, ctx)
+            context, memories = await self._dual_recall(ctx.content, ctx)
             modulated = self._subconscious.inject(context, severity)
             if modulated:
                 # 追加到消息历史末尾（子 Session 下次 _think() 可见）
                 loop._messages.append(
                     Message(role="system", content=f"[主脑提示] {modulated}")
                 )
+            return context, memories
         except Exception:
             logger.exception("异步注入失败: user=%s", ctx.user_id[:12])
+            return "", []
+
+    # ── 异步审查 (T012, T013) ───────────────────────────────
+
+    async def _async_review_and_decide(
+        self,
+        replies: list[str],
+        inner_thoughts: str | None,
+        memories: list[MemoryEntry],
+        ctx: MessageContext,
+    ) -> None:
+        """异步审查子Session 回复，写入 subconscious/corrections 或归档到 self/noticed/。
+
+        审查不阻塞 send_reply，fire-and-forget 执行。
+        T013: 若写入 corrections，同时归档纠正内容到 MemoryStore。
+        """
+        try:
+            review = await self._review_system.review(
+                replies, inner_thoughts, memories, ctx.content,
+            )
+        except Exception:
+            logger.exception("审查执行失败: user=%s", ctx.user_id[:12])
+            return
+
+        combined = review.combined_weight
+
+        if combined > 0.5:
+            # 写入 subconscious/corrections，下一轮子Session 自动读取纠正
+            try:
+                correction_key = f"correction_{ctx.session_key}_{int(time.time())}"
+                error_descriptions = [e.description for e in review.logic_errors]
+                issue_descriptions = [i.description for i in review.emotion_issues]
+
+                await self._memory.save(MemoryEntry(
+                    namespace="subconscious/corrections",
+                    key=correction_key,
+                    value={
+                        "logic_errors": error_descriptions,
+                        "tone_issues": issue_descriptions,
+                        "combined_weight": combined,
+                        "logic_weight": review.logic_weight,
+                        "emotion_weight": review.emotion_weight,
+                        "decision": review.decision.value,
+                        "original_replies": replies,
+                        "user_id": ctx.user_id,
+                    },
+                ))
+                logger.info(
+                    "审查纠正已写入: user=%s combined=%.2f",
+                    ctx.user_id[:12], combined,
+                )
+
+                # T013: 纠正内容归档 — inner_thoughts + send_reply
+                try:
+                    await self._memory.save(MemoryEntry(
+                        namespace="self/inner_thoughts",
+                        key=f"{ctx.session_key}_correction_{int(time.time())}",
+                        value={
+                            "raw": inner_thoughts or "",
+                            "user_id": ctx.user_id,
+                            "type": "correction",
+                        },
+                    ))
+                    await self._memory.save(MemoryEntry(
+                        namespace=f"user/{ctx.user_id}/c2c/conversations",
+                        key=f"correction_{int(time.time())}",
+                        value={
+                            "user_message": ctx.content,
+                            "reply": " ".join(replies),
+                            "inner_thoughts": inner_thoughts,
+                            "type": "correction_review",
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        },
+                    ))
+                except Exception:
+                    logger.debug("纠正内容归档失败: user=%s", ctx.user_id[:12])
+            except Exception:
+                logger.exception("写入 corrections 失败: user=%s", ctx.user_id[:12])
+        else:
+            # combined ≤ 0.5: 归档到 self/noticed/
+            try:
+                await self._memory.save(MemoryEntry(
+                    namespace="self/noticed",
+                    key=f"noticed_{ctx.session_key}_{int(time.time())}",
+                    value={
+                        "combined_weight": combined,
+                        "logic_weight": review.logic_weight,
+                        "emotion_weight": review.emotion_weight,
+                        "logic_errors": [e.description for e in review.logic_errors],
+                        "tone_issues": [i.description for i in review.emotion_issues],
+                        "original_replies": replies,
+                        "user_id": ctx.user_id,
+                    },
+                ))
+                logger.debug("审查沉默归档: user=%s combined=%.2f", ctx.user_id[:12], combined)
+            except Exception:
+                logger.debug("沉默归档失败: user=%s", ctx.user_id[:12])
 
     # ── 用户画像 ────────────────────────────────────────────
 
@@ -348,6 +496,18 @@ class BotAdapter:
             "turn_id": f"{ctx.session_key}_turn_{user_session.turn_counter:03d}",
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+
+        # Spec 007: 附加主观时间感知
+        if self._subjective_clock:
+            fatigue = self._energy_bar.get_state().energy
+            stp = self._subjective_clock.get_perception(fatigue)
+            summary["subjective_time_perception"] = {
+                "speed_factor": stp.speed_factor,
+                "perception": stp.perception,
+                "description": stp.description,
+                "fatigue_at_end": stp.fatigue_at_end,
+            }
+
         try:
             await self._memory.save(MemoryEntry(
                 namespace=ns,

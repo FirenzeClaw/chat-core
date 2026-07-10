@@ -11,6 +11,7 @@ from typing import Any
 
 import aiosqlite
 
+from chat_core.config import get_config
 from chat_core.core.types import MemoryEntry, MemoryLink, RelationType, ChainedMemory, RecallChainConfig
 
 # ── 衰减常量 ──────────────────────────────────────────────
@@ -45,6 +46,32 @@ class MemoryStore:
         self._db_path = Path(db_path)
         self._db: aiosqlite.Connection | None = None
         self._decay_task: asyncio.Task | None = None
+        # ── Spec 003 §12: 幂律衰减配置 ──
+        try:
+            cfg = get_config()
+            mc = cfg.memory_config()
+            decay_cfg = mc.get("decay", {})
+            self._decay_enabled: bool = bool(decay_cfg.get("enabled", True))
+            self._decay_standard_beta: float = float(decay_cfg.get("standard_beta", 0.01))
+            self._decay_deep_beta: float = float(decay_cfg.get("deep_beta", 0.001))
+            self._decay_alpha: float = float(decay_cfg.get("alpha", 0.5))
+            mig = decay_cfg.get("migration", {})
+            self._migrate_up_threshold: float = float(mig.get("short_to_long_salience", 5))
+            self._migrate_down_threshold: float = float(mig.get("long_to_short_salience", 3))
+            self._deep_threshold: float = float(mig.get("deep_salience", 7))
+            self._deep_fallback: float = float(mig.get("deep_fallback", 5))
+            self._trim_short_max: int = int(decay_cfg.get("trim_short_max", 10))
+        except Exception:
+            # Config 不可用时使用默认值（测试环境常见）
+            self._decay_enabled = True
+            self._decay_standard_beta = 0.01
+            self._decay_deep_beta = 0.001
+            self._decay_alpha = 0.5
+            self._migrate_up_threshold = 5.0
+            self._migrate_down_threshold = 3.0
+            self._deep_threshold = 7.0
+            self._deep_fallback = 5.0
+            self._trim_short_max = 10
 
     async def open(self) -> None:
         """打开数据库，创建表结构，启用 WAL 模式及并发安全设置"""
@@ -60,6 +87,7 @@ class MemoryStore:
         await self._create_tables()
         await self._migrate_schema_003()
         await self._migrate_schema_decay()
+        await self._migrate_schema_012()
         await self._db.commit()
 
     async def close(self) -> None:
@@ -183,6 +211,22 @@ class MemoryStore:
         if "decay_start" not in columns:
             await self._db.execute("ALTER TABLE memories ADD COLUMN decay_start TEXT")
 
+    async def _migrate_schema_012(self) -> None:
+        """Spec 003 §12: 添加 created_at_epoch REAL 列用于幂律时间基准"""
+        assert self._db
+        cursor = await self._db.execute("PRAGMA table_info('memories')")
+        columns = [row[1] for row in await cursor.fetchall()]
+        if "created_at_epoch" not in columns:
+            await self._db.execute(
+                "ALTER TABLE memories ADD COLUMN created_at_epoch REAL DEFAULT (unixepoch())"
+            )
+            # 存量数据回填
+            await self._db.execute(
+                "UPDATE memories SET created_at_epoch = unixepoch(created_at) "
+                "WHERE created_at_epoch IS NULL AND created_at IS NOT NULL"
+            )
+            await self._db.commit()
+
     # ── CRUD ────────────────────────────────────────────────
 
     async def save(self, entry: MemoryEntry) -> None:
@@ -194,8 +238,9 @@ class MemoryStore:
             """INSERT OR REPLACE INTO memories
                (namespace, key, value, layer, salience, entity_type, topic_tags,
                 emotional_tags, created_at, updated_at, expires_at, ttl,
-                access_count, last_access, decay_curve, auto_migrate, decay_start)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                access_count, last_access, decay_curve, auto_migrate, decay_start,
+                created_at_epoch)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 entry.namespace, entry.key,
                 json.dumps(entry.value, ensure_ascii=False),
@@ -211,6 +256,7 @@ class MemoryStore:
                 entry.decay_curve,
                 entry.auto_migrate,
                 entry.decay_start,
+                time.time() if entry.created_at_epoch is None else entry.created_at_epoch,
             ),
         )
         await self._db.commit()
@@ -691,6 +737,16 @@ class MemoryStore:
                 return f"（{text}）"
         return ""
 
+    def _time_annotate(self, cm: ChainedMemory) -> str:
+        """Spec 007: 检测主观时间感知并生成注解"""
+        e = cm.entry
+        if not isinstance(e.value, dict):
+            return ""
+        stp = e.value.get("subjective_time_perception")
+        if isinstance(stp, dict) and stp.get("perception") == "immersed":
+            return "（那次聊得特别投入，时间过得飞快）"
+        return ""
+
     def _derive_emotion_inference(self, entries: list[ChainedMemory]) -> str | None:
         """检测多条记忆的情绪一致性，生成推演"""
         emotions: list[str] = []
@@ -727,23 +783,29 @@ class MemoryStore:
 
         lines: list[str] = []
 
-        # 第一条: "我记得" + 情绪注解
+        # 第一条: "我记得" + 情绪注解 + 时间注解
         direct = entries[0]
         summary = self._summarize(direct)
         annot = self._emotion_annotate(direct)
+        time_annot = self._time_annotate(direct)
         line = f"我记得：{summary}。"
         if annot:
             line += annot
+        if time_annot:
+            line += time_annot
         lines.append(line)
 
-        # 延伸记忆: 随机连接词 + 情绪注解
+        # 延伸记忆: 随机连接词 + 情绪注解 + 时间注解
         for cm in entries[1:]:
             connector = random.choice(self._CONNECTORS)
             summary = self._summarize(cm)
             annot = self._emotion_annotate(cm)
+            time_annot = self._time_annotate(cm)
             line = f"{connector}：{summary}。"
             if annot:
                 line += annot
+            if time_annot:
+                line += time_annot
             lines.append(line)
 
         # 情绪推演
@@ -797,8 +859,11 @@ class MemoryStore:
         # ④ 深刻化: salience + access_count boost
         await self._apply_salience_boost(final)
 
-        # ⑤ 异步触发记忆分级迁移
+        # ⑤ 异步触发记忆分级迁移 (双向)
         asyncio.create_task(self._migrate_short_to_long())
+        asyncio.create_task(self._downgrade_long_to_short())
+        asyncio.create_task(self._mark_deep_memory())
+        asyncio.create_task(self._unmark_deep_memory())
         asyncio.create_task(self._trim_short_term())
 
         return final
@@ -813,32 +878,80 @@ class MemoryStore:
         4: 0.10,   # namespace
     }
 
+    @staticmethod
+    def effective_salience(
+        salience: float,
+        created_at_epoch: float | None,
+        now_ts: float,
+        decay_curve: str = "standard",
+        standard_beta: float = 0.01,
+        deep_beta: float = 0.001,
+        alpha: float = 0.5,
+        enabled: bool = True,
+    ) -> float:
+        """幂律衰减后的有效 salience。S / (1 + β × t^α)
+
+        Args:
+            salience: 原始 salience [0, 10]
+            created_at_epoch: 创建时间 (unix timestamp)，None 则不衰减
+            now_ts: 当前时间 (unix timestamp)
+            decay_curve: "standard" | "deep" | "none"
+            standard_beta: standard 曲线 β
+            deep_beta: deep 曲线 β
+            alpha: 曲率
+            enabled: 全局开关
+        """
+        if not enabled or created_at_epoch is None or decay_curve == "none":
+            return salience
+        t_days = (now_ts - created_at_epoch) / 86400.0
+        if t_days <= 0:
+            return salience
+        beta = deep_beta if decay_curve == "deep" else standard_beta
+        return salience / (1.0 + beta * (t_days ** alpha))
+
     async def _apply_salience_boost(self, results: list[ChainedMemory]) -> None:
-        """对所有命中记忆执行 salience + access_count 递增"""
+        """对所有命中记忆执行：幂律衰减 → salience boost → 硬上限。
+
+        顺序: effective_salience() → 写回 DB → salience += chain_boost → MIN(10.0)
+        decay.enabled=false 时跳过衰减，仅执行 boost（Spec 003 原始行为）。
+        """
         assert self._db
-        now = datetime.now().isoformat()
+        now_ts = time.time()
+        now_iso = datetime.now().isoformat()
         for cm in results:
+            e = cm.entry
+            # ① 幂律衰减
+            effective = self.effective_salience(
+                e.salience,
+                getattr(e, 'created_at_epoch', None),
+                now_ts,
+                getattr(e, 'decay_curve', 'standard'),
+                self._decay_standard_beta,
+                self._decay_deep_beta,
+                self._decay_alpha,
+                enabled=self._decay_enabled,
+            )
+            # ② boost
             boost = self._SALIENCE_BOOST.get(cm.chain_level, 0.10)
-            namespace = cm.entry.namespace
-            key = cm.entry.key
-            # 原子 UPDATE
+            new_salience = min(effective + boost, 10.0)
+            # ③ 写回
             await self._db.execute(
                 """UPDATE memories SET
-                   salience = MIN(salience + ?, 10.0),
+                   salience = ?,
                    access_count = access_count + 1,
                    last_access = ?
                    WHERE namespace = ? AND key = ?""",
-                (boost, now, namespace, key),
+                (new_salience, now_iso, e.namespace, e.key),
             )
         await self._db.commit()
 
     async def _migrate_short_to_long(self) -> None:
-        """短期记忆 → 长期记忆：salience ≥ 5 且 access_count ≥ 3 的迁移到 user/*"""
+        """短期记忆 → 长期记忆：salience ≥ 配置阈值 且 access_count ≥ 3 的迁移到 user/*"""
         assert self._db
         try:
             cursor = await self._db.execute(
-                "SELECT * FROM memories WHERE namespace LIKE ? AND salience >= 5 AND access_count >= 3",
-                ("short_term/%",),
+                "SELECT * FROM memories WHERE namespace LIKE ? AND salience >= ? AND access_count >= 3",
+                ("short_term/%", self._migrate_up_threshold),
             )
             rows = await cursor.fetchall()
             for row in rows:
@@ -869,21 +982,77 @@ class MemoryStore:
         except Exception:
             pass  # 静默失败，不影响主流程
 
+    async def _downgrade_long_to_short(self) -> None:
+        """长期记忆 → 短期记忆：salience < downgrade_threshold 的迁回 short_term/*。
+
+        保留 access_count 和 last_access，不重置计数器。
+        decay.enabled=false 时跳过。
+        """
+        if not self._decay_enabled:
+            return
+        assert self._db
+        try:
+            cursor = await self._db.execute(
+                "SELECT * FROM memories WHERE namespace NOT LIKE ? AND salience < ?",
+                ("short_term/%", self._migrate_down_threshold),
+            )
+            rows = await cursor.fetchall()
+            for row in rows:
+                entry = self._row_to_entry(row)
+                old_ns = entry.namespace
+                # 构造新 namespace: user/... → short_term/user/...
+                new_ns = f"short_term/{old_ns}"
+                # 不重置 access_count 和 last_access
+                await self.save(MemoryEntry(
+                    namespace=new_ns, key=entry.key,
+                    value=entry.value, salience=entry.salience,
+                    access_count=entry.access_count,
+                    last_access=entry.last_access,
+                    decay_curve=entry.decay_curve,
+                    created_at=entry.created_at,
+                    created_at_epoch=entry.created_at_epoch,
+                ))
+                await self._db.execute(
+                    "DELETE FROM memories WHERE namespace = ? AND key = ?",
+                    (old_ns, entry.key),
+                )
+            if rows:
+                await self._db.commit()
+        except Exception:
+            pass
+
     async def _mark_deep_memory(self) -> None:
-        """长期记忆 → 深刻记忆：salience ≥ 7 的标记 decay_curve='deep'"""
+        """长期记忆 → 深刻记忆：salience ≥ 配置阈值 的标记 decay_curve='deep'"""
         assert self._db
         try:
             await self._db.execute(
                 "UPDATE memories SET decay_curve = 'deep' "
-                "WHERE salience >= 7 AND decay_curve != 'deep' "
-                "AND namespace NOT LIKE 'short_term/%'"
+                "WHERE salience >= ? AND decay_curve != 'deep' "
+                "AND namespace NOT LIKE 'short_term/%'",
+                (self._deep_threshold,),
+            )
+            await self._db.commit()
+        except Exception:
+            pass
+
+    async def _unmark_deep_memory(self) -> None:
+        """深刻记忆回退：salience < deep_fallback 的标记 decay_curve='standard'"""
+        if not self._decay_enabled:
+            return
+        assert self._db
+        try:
+            await self._db.execute(
+                "UPDATE memories SET decay_curve = 'standard' "
+                "WHERE salience < ? AND decay_curve = 'deep' "
+                "AND namespace NOT LIKE 'short_term/%'",
+                (self._deep_fallback,),
             )
             await self._db.commit()
         except Exception:
             pass
 
     async def _trim_short_term(self) -> None:
-        """short_term/* 裁剪至最多 10 条（按 salience 降序保留）"""
+        """short_term/* 裁剪至最多配置上限条（按 salience 降序保留）"""
         assert self._db
         try:
             cursor = await self._db.execute(
@@ -892,8 +1061,8 @@ class MemoryStore:
                 ("short_term/%",),
             )
             rows = await cursor.fetchall()
-            if len(rows) > 10:
-                for row in rows[10:]:
+            if len(rows) > self._trim_short_max:
+                for row in rows[self._trim_short_max:]:
                     await self._db.execute(
                         "DELETE FROM memories WHERE namespace = ? AND key = ?",
                         (row["namespace"], row["key"]),
@@ -1094,4 +1263,5 @@ class MemoryStore:
             decay_curve=row["decay_curve"] if row["decay_curve"] else "standard",
             auto_migrate=int(row["auto_migrate"]) if row["auto_migrate"] is not None else 0,
             decay_start=row["decay_start"] if row["decay_start"] else None,
+            created_at_epoch=float(row["created_at_epoch"]) if row["created_at_epoch"] is not None else None,
         )

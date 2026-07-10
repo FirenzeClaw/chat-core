@@ -3,7 +3,7 @@
 一个有记忆、有情绪、有判断力的终端 AI 伙伴。
 
 [![Python](https://img.shields.io/badge/python-3.12+-blue)](https://python.org)
-[![Tests](https://img.shields.io/badge/tests-95%20passed-green)](#)
+[![Tests](https://img.shields.io/badge/tests-154%20passed-green)](#)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 ```

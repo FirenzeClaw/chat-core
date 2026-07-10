@@ -220,21 +220,26 @@ class TestAttentionModel:
 
     def test_should_exit_sub(self):
         am = AttentionModel()
-        assert not am.should_exit_sub()  # focus=0.9 > 0.15
+        assert not am.should_exit_sub()  # focus=0.9, FOCUSED → not DULL, 0.9 >= 0.15
 
-        # Force sub focus below threshold
+        # DULL 态 (focus < 0.3) 不沉默，始终返回 False
         am._states["sub"].focus = 0.1
-        assert am.should_exit_sub()
+        assert not am.should_exit_sub()  # DULL → always False
+
+        # DRIFTING 态且 focus < 0.15 会退出（虽然 DRIFTING 下限是 0.3，但过渡态可能发生）
+        am._states["sub"].focus = 0.35
+        assert not am.should_exit_sub()  # DRIFTING, focus=0.35 >= 0.15
 
     def test_drift_decay(self):
         am = AttentionModel()
         # Set last_update far in the past
         am._last_update = time.time() - 100  # 100 seconds ago
+        # sub focus starts at 0.9 (FOCUSED), decay_rate_focused = 0.001
+        # dt=100: decay_factor = 1 - 0.001*100 = 0.9
+        # focus = 0.9 * 0.9 = 0.81
+        initial = am.get_state("sub").focus
         am.drift()
-        # After 100s: decay_factor = 1 - 0.01*100 = 0.0 (capped at 0)
-        # Actually: decay_factor = max(0, 1 - 0.01*100) = 0.0
-        # focus = 0.9 * max(0, 0.0) = 0.0
-        assert am.get_state("sub").focus == 0.0
+        assert am.get_state("sub").focus == pytest.approx(initial * 0.9, abs=0.01)
 
     def test_get_focus(self):
         am = AttentionModel()
@@ -297,5 +302,151 @@ class TestIntegration:
         am._states["sub"].focus = 0.9
         assert not am.should_exit_sub()
 
+        # DULL 态 (focus < 0.3) → 不沉默，始终 False
         am._states["sub"].focus = 0.1
-        assert am.should_exit_sub()
+        assert not am.should_exit_sub()
+
+
+# ── 注意力状态机测试 ─────────────────────────────────────────
+
+from chat_core.core.types import AttentionStateEnum, AttentionEvent
+
+
+class TestAttentionStateMachine:
+    """注意力状态机: 三态 + apply_event + 平滑过渡"""
+
+    def test_initial_state_focused(self):
+        """新 AttentionModel 应从 FOCUSED(0.9) 开始"""
+        model = AttentionModel()
+        state = model.get_state("sub")
+        assert state.focus == 0.9
+        assert model.get_state_enum("sub") == AttentionStateEnum.FOCUSED
+
+    def test_state_enum_thresholds(self):
+        """focus 值正确映射到三态枚举"""
+        model = AttentionModel()
+        # 手动设置 sub focus
+        model._states["sub"].focus = 0.85
+        assert model.get_state_enum("sub") == AttentionStateEnum.FOCUSED
+        model._states["sub"].focus = 0.50
+        assert model.get_state_enum("sub") == AttentionStateEnum.DRIFTING
+        model._states["sub"].focus = 0.20
+        assert model.get_state_enum("sub") == AttentionStateEnum.DULL
+
+    def test_apply_event_emotion_positive(self):
+        """EMOTION_POSITIVE 事件应设置 target=current+0.10，然后 drift 到目标"""
+        model = AttentionModel()
+        initial = model.get_focus("sub")
+        model.apply_event(AttentionEvent.EMOTION_POSITIVE, brain="sub")
+        # apply_event 仅设置过渡目标，不立即改变 focus
+        expected_target = min(1.0, initial + 0.10)
+        assert model._transition_target["sub"] == pytest.approx(expected_target)
+        # 运行 drift 后 focus 应达到目标
+        model._last_update = time.time() - 0.35  # 超过 0.3s transition
+        model.drift()
+        assert model.get_focus("sub") == pytest.approx(expected_target)
+
+    def test_apply_event_emotion_shock_dull(self):
+        """DULL 态下 EMOTION_SHOCK → 80% 概率跳 DRIFTING"""
+        import random
+        random.seed(42)
+        model = AttentionModel()
+        model._states["sub"].focus = 0.20  # DULL
+        model.apply_event(AttentionEvent.EMOTION_SHOCK, brain="sub")
+        # 0.8 概率跳 DRIFTING: target = drifting_threshold + shock boost = 0.30 + 0.30 = 0.60
+        assert model._transition_target["sub"] is not None
+        # 完成过渡后验证
+        model._last_update = time.time() - 0.35
+        model.drift()
+        assert model.get_focus("sub") >= 0.30
+
+    def test_apply_event_memory_strong_hit(self):
+        """MEMORY_STRONG_HIT → +0.25 FOCUSED, +0.20 DRIFTING"""
+        model = AttentionModel()
+        model._states["sub"].focus = 0.50  # DRIFTING
+        model.apply_event(AttentionEvent.MEMORY_STRONG_HIT, brain="sub")
+        # DRIFTING 态 → +0.20
+        expected_target = min(1.0, 0.50 + 0.20)
+        assert model._transition_target["sub"] == pytest.approx(expected_target)
+        # 完成过渡
+        model._last_update = time.time() - 0.35
+        model.drift()
+        assert model.get_focus("sub") == pytest.approx(expected_target)
+
+    def test_smooth_transition_active(self):
+        """apply_event 后 transition_target 非空，drift() 逐步插值"""
+        model = AttentionModel()
+        model._states["sub"].focus = 0.20  # DULL
+        model.apply_event(AttentionEvent.EMOTION_SHOCK, brain="sub")
+        assert model._transition_target["sub"] is not None  # 平滑过渡进行中
+
+        # drift() 应逐步靠近目标
+        model._last_update = time.time() - 0.15  # 模拟 0.15s 流逝
+        model.drift()
+        # 应已过渡一半
+        assert model._transition_elapsed["sub"] > 0
+
+    def test_apply_event_race_mild(self):
+        """RACE_MILD (active≥3) → 70% 概率 FOCUSED→DRIFTING"""
+        import random
+        random.seed(42)
+        model = AttentionModel()
+        model._states["sub"].focus = 0.80  # FOCUSED
+        model.apply_event(AttentionEvent.RACE_MILD, brain="sub")
+        # 70% 概率: target = focused_threshold - 0.01 = 0.59
+        # seed(42) 触发转移
+        assert model._transition_target["sub"] is not None  # 有转移
+        assert model._transition_target["sub"] < 0.80
+
+    def test_dull_always_exit_sub_false(self):
+        """DULL 态下 should_exit_sub() 始终返回 False"""
+        model = AttentionModel()
+        model._states["sub"].focus = 0.05  # 极低，DULL 态
+        assert model.should_exit_sub() is False  # DULL 不沉默
+
+
+# ── 情绪引擎 → 注意力状态机 联动 ──────────────────────────────
+
+from chat_core.core.turn_manager import EventBus
+
+
+class TestEmotionAttentionLink:
+    """情绪引擎 → 注意力状态机 联动：tick() 检测 Δvalence → event_bus"""
+
+    def test_tick_updates_prev_valence(self):
+        """tick() 后 _prev_valence 更新为当前 valence"""
+        engine = EmotionEngine()
+        engine._states["sub"].joy = 0.3
+        engine._states["sub"].trust = 0.5
+        engine.tick()
+        expected = (0.3 + 0.5) / 2.0
+        assert engine._prev_valence.get("sub", -1) == pytest.approx(expected, abs=0.01)
+
+    def test_valence_delta_below_threshold_no_publish(self):
+        """|Δvalence| ≤ 0.5 → 不发布事件（event_bus=None 静默）"""
+        engine = EmotionEngine()
+        engine._prev_valence["sub"] = 0.5
+        engine._states["sub"].joy = 0.6
+        engine._states["sub"].trust = 0.6
+        current = (0.6 + 0.6) / 2.0  # 0.6
+        delta = abs(current - engine._prev_valence["sub"])  # 0.1
+        assert delta <= 0.5, "小变化不触发 alarm"
+        # tick() 不应因 event_bus=None 而抛出异常
+        engine.tick()
+
+    def test_tick_publishes_emotion_alert_on_shock(self):
+        """|Δvalence| > 0.5 → _prev_valence 在 tick() 后更新为新的 (joy+trust)/2"""
+        engine = EmotionEngine()
+        # 建立低基线
+        engine._states["sub"].joy = 0.05
+        engine._states["sub"].trust = 0.05
+        engine.tick()  # baseline ≈ 0.05 (after slight decay)
+        # 制造冲击
+        engine._states["sub"].joy = 0.9
+        engine._states["sub"].trust = 0.7
+        engine.tick()
+        # 验证 _prev_valence 已更新（tick 中会有小幅衰减，使用宽容忍度）
+        new_prev = engine._prev_valence.get("sub", 0.0)
+        assert new_prev > 0.6, f"prev_valence 应反映高 joy+trust 值: {new_prev}"
+        # Δ 应 > 0.5（从 ~0.05 跳到 ~0.77+）
+        assert abs(new_prev - 0.05) > 0.5

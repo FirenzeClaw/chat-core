@@ -14,6 +14,7 @@ import json
 import logging
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Awaitable
 
@@ -27,8 +28,8 @@ logger = logging.getLogger("chat_core.qq.protocol")
 # DIRECT_MESSAGE       (1<<12): 频道私信 (DIRECT_MESSAGE_CREATE)
 INTENTS = (1 << 30) | (1 << 25) | (1 << 12)
 
-# 消息去重
-_seen_msg_ids: set[str] = set()
+# 消息去重 — 使用 deque 实现 LRU 逐出，避免全量 clear() 丢失去重状态
+_seen_msg_ids: deque[str] = deque(maxlen=10000)
 MAX_SEEN_IDS = 10000
 
 # Token 缓存
@@ -37,7 +38,10 @@ _token_expires: float = 0
 
 
 async def _get_access_token(appid: str, secret: str) -> str:
-    """获取/刷新 QQ Bot access_token（7200s 有效期，提前 5 分钟刷新）"""
+    """获取/刷新 QQ Bot access_token（7200s 有效期，提前 5 分钟刷新）
+
+    失败时设 60s 短过期避免缓存空 token，最多重试 2 次。
+    """
     import aiohttp
 
     global _access_token, _token_expires
@@ -47,23 +51,57 @@ async def _get_access_token(appid: str, secret: str) -> str:
     url = "https://bots.qq.com/app/getAppAccessToken"
     payload = {"appId": appid, "clientSecret": secret}
 
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=payload) as resp:
-            data = await resp.json()
-            _access_token = data.get("access_token", "")
-            expires = int(data.get("expires_in", 7200))
-            _token_expires = time.time() + expires - 300
-            logger.info("access_token 已获取，有效期 %ds", expires)
-            return _access_token
+    last_error: str = ""
+    for attempt in range(3):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload) as resp:
+                    if resp.status != 200:
+                        last_error = f"HTTP {resp.status}"
+                        logger.warning(
+                            "access_token 获取失败 (attempt %d/3): %s", attempt + 1, last_error
+                        )
+                        if attempt < 2:
+                            await asyncio.sleep(1 * (attempt + 1))
+                        continue
+
+                    data = await resp.json()
+                    token = data.get("access_token", "")
+                    if not token:
+                        last_error = "empty token in response"
+                        logger.warning(
+                            "access_token 响应无有效 token (attempt %d/3): %s",
+                            attempt + 1, data.get("message", data),
+                        )
+                        if attempt < 2:
+                            await asyncio.sleep(1 * (attempt + 1))
+                        continue
+
+                    _access_token = token
+                    expires = int(data.get("expires_in", 7200))
+                    _token_expires = time.time() + expires - 300
+                    logger.info("access_token 已获取，有效期 %ds", expires)
+                    return _access_token
+
+        except Exception as e:
+            last_error = str(e)
+            logger.warning(
+                "access_token 请求异常 (attempt %d/3): %s", attempt + 1, e
+            )
+            if attempt < 2:
+                await asyncio.sleep(1 * (attempt + 1))
+
+    # 全部重试失败：设短过期避免持续打 API，返回空字符串让调用方处理
+    _token_expires = time.time() + 60
+    logger.error("access_token 获取全部失败 (3 attempts): %s", last_error)
+    return ""
 
 
 def _is_duplicate(msg_id: str) -> bool:
-    """检查消息是否重复，并自动限制 set 大小"""
+    """检查消息是否重复（deque maxlen 自动逐出最旧条目，无需全量清空）"""
     if msg_id in _seen_msg_ids:
         return True
-    _seen_msg_ids.add(msg_id)
-    if len(_seen_msg_ids) > MAX_SEEN_IDS:
-        _seen_msg_ids.clear()
+    _seen_msg_ids.append(msg_id)
     return False
 
 

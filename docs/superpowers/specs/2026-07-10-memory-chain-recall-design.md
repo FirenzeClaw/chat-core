@@ -1,9 +1,9 @@
-# Design: 记忆联锁 + Recall 深刻化 + 记忆分级 + 自然语言回溯
+# Design: 记忆联锁 + Recall 深刻化 + 记忆分级 + 自然语言回溯 + 遗忘曲线
 
 > **Feature**: memory-chain-recall
-> **Status**: Design Approved
+> **Status**: Design Approved (extended 2026-07-10 with §12 遗忘曲线)
 > **Created**: 2026-07-10
-> **Context**: chat-core 当前 MemoryStore 缺少 salience 衰减、短期/长期记忆分级、回忆联锁(recollection chaining) 和自然语言回溯。本设计补齐全部缺口。
+> **Context**: chat-core 当前 MemoryStore 缺少 salience 衰减、短期/长期记忆分级、回忆联锁(recollection chaining)、自然语言回溯和遗忘曲线。本设计补齐全部缺口。§12 遗忘曲线在 brainstorming session 中追加，与 Spec 003 一次性实施以避免两次 schema 迁移。
 
 ---
 
@@ -44,12 +44,17 @@
 ## 2. MemoryStore Schema 新增
 
 ```sql
--- 仅本次新增，衰减系统留后续 Phase
+-- Spec 003 + 遗忘曲线 一次性新增 4 列
 ALTER TABLE memories ADD COLUMN access_count INTEGER DEFAULT 0;
 ALTER TABLE memories ADD COLUMN last_access TEXT;
+ALTER TABLE memories ADD COLUMN decay_curve TEXT DEFAULT 'standard';
+ALTER TABLE memories ADD COLUMN created_at_epoch REAL DEFAULT (unixepoch());
 ```
 
-`salience` 字段已存在 (DEFAULT 5.0)，本次使其真正生效。
+`salience` 字段已存在 (REAL DEFAULT 5.0)，本次使其真正生效。
+`decay_curve` 取值: `'standard'` | `'deep'` | `'none'`。`created_at_epoch` 为幂律衰减的时间基准（§12）。
+
+> **实施注意**：`created_at_epoch` 列仅在设计文档中定义，代码尚未落地。现有代码使用 `created_at` TEXT 列。实施时需通过 ALTER TABLE 新增此 REAL 列，并对存量数据回填 `unixepoch(created_at)`。
 
 ---
 
@@ -206,9 +211,9 @@ entity_type (L3):      salience += 0.15
 namespace (L4):        salience += 0.10
 ```
 
-### 6.2 遗忘（遗留后续 Phase）
+### 6.2 遗忘曲线
 
-本次不做衰减。衰减系统 (艾宾浩斯曲线、decay_curve、apply_decay) 参考 chat-engine 实现，单独一个 Phase。
+幂律衰减已纳入本次实施范围——详见 **§12 遗忘曲线**。衰减在 `search_chained()` 深刻化步骤中与 boost 合并执行（先衰减后 boost），支持 bidirectional 迁移（晋升 + 降级 + deep 回退）。配置开关 `decay.enabled=false` 可回退到 Spec 003 原始行为（只升不降）。
 
 ---
 
@@ -376,8 +381,8 @@ def _format_recall_result(entries: list[ChainedMemory]) -> str:
 | access_count / last_access | ✅ 新增 |
 | decay_curve (standard/deep/none) | ✅ 深刻记忆标记 'deep'，标准化曲线留后续 |
 | 高频访问 boost (7天≥3次→延长15天) | ❌ 留后续衰减 Phase |
-| apply_decay() 艾宾浩斯系统 | ❌ 留后续衰减 Phase |
-| auto_migrate detail→gist | ❌ 留后续衰减 Phase |
+| apply_decay() 幂律衰减 | ✅ §12 — 幂律公式 `S/(1+β×t^α)`，双曲线 + 双向迁移 |
+| auto_migrate detail→gist | ❌ 留后续 Phase |
 | 情绪调制检索 (mood-congruent) | ✅ 自然语言回溯中体现 |
 
 ---
@@ -387,11 +392,12 @@ def _format_recall_result(entries: list[ChainedMemory]) -> str:
 | 文件 | 改动 | 说明 |
 |------|------|------|
 | `core/types.py` | +`ChainedMemory`, +`RecallChainConfig` | 新增数据类型 |
-| `systems/memory.py` | +`access_count`/`last_access` schema, +`search_chained()`, +`_extend_chain()`, +`_dedup_by_quality()`, +`_migrate_short_to_long()`, +`_trim_short_term()`, +`_format_recall_result()`, +4级 fallback 查询方法, +salience boost | 核心逻辑 |
+| `systems/memory.py` | +4列 schema, +`search_chained()`, +`_extend_chain()` 4级 fallback, +`_dedup_by_quality()`, +`_migrate_short_to_long()`, +`_downgrade_long_to_short()`, +`_mark_deep_memory()`, +`_unmark_deep_memory()`, +`_trim_short_term()`, +`_format_recall_result()`, +`effective_salience()`, +salience boost + 衰减嵌入 | 核心逻辑 |
+| `config.yaml` | + `systems.memory.decay` 段（衰减公式、迁移阈值、裁剪上限） | 配置外化 |
 | `core/brain.py` | `_execute_recall` → 改用 `search_chained` (主脑配置) | 主脑 recall 升级 |
 | `core/loop.py` | `register_sub_session_tools` 改为接收 `chain_config` 参数; recall handler 用 `search_chained`; 返回自然语言文本 | 子Session recall 升级 |
 | `qq/adapter.py` | `_get_or_create_sub_session` 传入 `user_id` + `scene`, 构造 `chain_config` | QQ Bot 适配 |
-| `tests/test_memory.py` | +联锁链测试, +深刻化测试, +分级迁移测试, +自然语言回溯测试 | 测试覆盖 |
+| `tests/test_memory.py` | +联锁链测试, +深刻化测试, +分级迁移测试, +自然语言回溯测试, +衰减测试, +双向迁移测试 | 测试覆盖 |
 | `tests/test_loop.py` | +子Session recall 隔离测试 | 工具权限测试 |
 | `tests/test_brain.py` | +主脑联锁 recall 测试 | 主脑测试 |
 | `tests/test_qq_adapter.py` | +子Session recall namespace 限制测试 | QQ Bot 集成 |
@@ -408,5 +414,142 @@ def _format_recall_result(entries: list[ChainedMemory]) -> str:
 | short_term 条目 salience≥5 且 access≥3 → 自动迁移 | `_migrate_short_to_long` 测试 |
 | 自然语言回溯含情绪注解和随机连接词 | 输出文本可验证 |
 | 无记忆时不机械输出 JSON | 返回自然语言 "暂时空白" 短语 |
-| 所有现有 108 tests 通过 | 无回归 |
-| 新增测试 ≥ 12 条 | pytest count 验证 |
+| 所有现有 154 tests 通过 | 无回归 |
+| 新增测试 ≥ 12 条 (Spec 003) | pytest count 验证 |
+| 幂律衰减：salience=5, 90天 → ~4.57 | search_chained 后 salience 可验证 |
+| deep 曲线减速 10× (β=0.001 vs 0.01) | 同条件 deep 衰减仅 ~1% |
+| 降级迁移：salience<3 迁回 short_term | `_downgrade_long_to_short` 测试 |
+| deep 回退：salience<5 → decay_curve='standard' | `_unmark_deep_memory` 测试 |
+| 滞后带防抖：salience∈[3,5) 不迁移 | 边界值测试 |
+| 配置开关：decay.enabled=false → 不衰减 | 功能开关测试 |
+
+---
+
+## 12. 遗忘曲线 (幂律衰减)
+
+> **Design Extension**: 在 Spec 003 记忆联锁基础上补齐遗忘能力。
+> **触发**: brainstorming session 2026-07-10，一次性覆盖联锁+遗忘，避免两次 schema 迁移。
+
+### 12.1 设计目标
+
+- 模拟艾宾浩斯遗忘：刚记住时忘得快，随时间推移遗忘速率变慢
+- 深刻记忆（decay_curve='deep'）几乎不衰减
+- salience 双向变化：recall 命中 → boost ↑，时间流逝 → decay ↓
+- 分级可降：长期记忆可降回短期，深刻可回退为常规
+
+### 12.2 幂律公式
+
+```python
+def effective_salience(entry: MemoryEntry, now_ts: float) -> float:
+    """计算时间衰减后的有效 salience。幂律：S / (1 + β × t^α)"""
+    t_days = (now_ts - entry.created_at_epoch) / 86400.0
+    if entry.decay_curve == 'deep':
+        beta = 0.001   # 10× 慢于 standard
+    else:
+        beta = 0.01
+    alpha = 0.5        # 曲率：α 越小初期越陡
+    return entry.salience / (1.0 + beta * (t_days ** alpha))
+```
+
+| curve | β | 30天后保留 | 90天后保留 | 365天后保留 |
+|-------|------|-----------|-----------|------------|
+| standard | 0.01 | 94.8% | 91.3% | 83.7% |
+| deep | 0.001 | 99.5% | 99.1% | 97.0% |
+
+**设计说明**：衰减系数温和——短期对话（分钟/小时级）几乎不可见衰减。主要靠"长时间不被 recall 访问"来拉低 salience（没有 boost 对抗自然衰减）。若一条记忆 90 天从未被 recall，salience=5 → 4.57，再 90 天 → 4.17，稳步滑落。
+
+### 12.3 search_chained() 衰减执行点
+
+在 Spec 003 §5.1 "④ 深刻化"步骤中，衰减先于 boost 执行：
+
+```
+④ 深刻化 + 衰减 (合并):
+   for each entry in results:
+     ① effective = effective_salience(entry, now)  ← 时间衰减
+     ② entry.salience = effective                   ← 衰减写回
+     ③ entry.salience += chain_boost(level)         ← 深刻化 boost
+     ④ MIN(entry.salience, 10.0)                    ← 硬上限
+     ⑤ entry.access_count += 1
+     ⑥ entry.last_access = now()
+```
+
+**顺序关键**：衰减→boost，确保"这次被回忆所以又被强化"。若先 boost 再衰减，同一次检索内衰减会吃掉 boost，丧失强化效果。
+
+**decay.enabled=false 时**：跳过步骤 ①②，直接从步骤 ③ 开始（与 Spec 003 原始行为一致）。
+
+### 12.4 双向迁移
+
+```
+save() / search_chained() 后异步触发:
+  │
+  ├─ _migrate_short_to_long()    晋升: short_term/* WHERE salience≥5 AND access_count≥3 → user/*
+  ├─ _downgrade_long_to_short()  降级: user/* WHERE salience<3 → short_term/*       ← 新增
+  ├─ _mark_deep_memory()         深刻: user/* WHERE salience≥7 AND decay_curve!='deep' → UPDATE
+  ├─ _unmark_deep_memory()       回退: user/* WHERE salience<5 AND decay_curve='deep' → UPDATE ← 新增
+  └─ _trim_short_term()          裁剪: short_term/* → 保留 top 10
+```
+
+**阈值设计**：晋升 ≥5，降级 <3 → 2 分滞后带防止边界抖动。deep 晋升 ≥7，回退 <5 → 同样滞后。
+
+**降级保留 access_count**：迁回 short_term 时不重置 access_count 和 last_access。若再次被 recall 命中，从已有计数继续累积——"忘了但一提醒就想起来"。
+
+### 12.5 配置外化
+
+```yaml
+# config.yaml → systems.memory.decay (新增段)
+systems:
+  memory:
+    decay:
+      enabled: true               # false = 不衰减不降级 (Spec 003 原始行为)
+      formula: "power_law"        # power_law | none
+      standard_beta: 0.01         # standard 曲线衰减系数
+      deep_beta: 0.001            # deep 曲线衰减系数 (10× 慢)
+      alpha: 0.5                  # 幂律曲率 (0<α≤1)
+      migration:
+        short_to_long_salience: 5
+        long_to_short_salience: 3
+        deep_salience: 7
+        deep_fallback: 5
+      trim_short_max: 10
+```
+
+### 12.6 Schema 新增
+
+```sql
+-- 在 Spec 003 的 3 列基础上，新增 1 列用于幂律时间基准
+ALTER TABLE memories ADD COLUMN created_at_epoch REAL DEFAULT (unixepoch());
+```
+
+`created_at_epoch`：幂律公式的 t 基准——"遗忘速度与距编码时间相关"比"距上次访问"更符合艾宾浩斯。已有 `created_at` TEXT 列保持不变（用于显示），新增 REAL 列用于高效计算。
+
+### 12.7 新增成功标准
+
+| ID | 标准 | 验证方式 |
+|----|------|---------|
+| SC-09 | 幂律衰减生效 | salience=5, created_at 设为 90天前 → search_chained 后 ≈4.57 |
+| SC-10 | deep 曲线 10× 减速 | deep 记忆同条件衰减仅 ~1% |
+| SC-11 | 降级迁移触发 | salience<3 的 user/* → 迁回 short_term/* |
+| SC-12 | deep 可回退 | salience<5 的 deep → decay_curve 变回 'standard' |
+| SC-13 | 滞后带防抖 | salience∈[3,5) 不被迁移 |
+| SC-14 | 配置开关 | decay.enabled=false → 不衰减不降级 |
+| SC-15 | 零回归 | 所有现有 154 tests 通过 |
+
+### 12.8 扩展改动文件
+
+| 文件 | 原 Spec 003 改动 | 本次扩展 |
+|------|-----------------|---------|
+| `systems/memory.py` | schema 3列 + search_chained + 延伸 + 去重 + 格式化 + 晋升迁移 + 裁剪 | + effective_salience() + _downgrade_long_to_short() + _unmark_deep_memory() + 衰减计算嵌入 search_chained |
+| `core/types.py` | + ChainedMemory, + RecallChainConfig | 无额外改动 |
+| `config.yaml` | 无 | + systems.memory.decay 段 |
+
+### 12.9 与 Spec 003 的整合
+
+不新建独立 spec，直接扩展 Spec 003：
+
+| 维度 | 扩展内容 |
+|------|---------|
+| spec.md | 新增 FR-23~26（衰减公式、降级迁移、deep回退、配置开关） |
+| plan.md | Phase 2 新增 WP-2.5（遗忘曲线），或合并 WP 到 Phase 2 |
+| tasks.md | 新增 ~8 tasks（衰减公式 2 + 降级迁移 2 + deep回退 1 + 配置 1 + 测试 2） |
+| data-model.md | MemoryEntry 新增 created_at_epoch 字段描述 |
+| 设计文档 (本文件) | 新增 §12 遗忘曲线（本文） |
