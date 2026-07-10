@@ -61,7 +61,7 @@ class TestLogicBrain:
         assert brain._provider is provider
         assert brain._memory is memory
         assert brain._prompt_engine is pe
-        assert len(brain._tools) == 4  # recall, memory_save, memory_link, inject_to_sub
+        assert len(brain._tools) == 5  # recall, memory_save, memory_link, inject_to_sub, metacognition_report
 
     def test_logic_brain_tools_registered(self):
         brain = LogicBrain(make_provider(), make_memory(), make_prompt_engine())
@@ -69,6 +69,7 @@ class TestLogicBrain:
         assert brain._tools.has("memory_save")
         assert brain._tools.has("memory_link")
         assert brain._tools.has("inject_to_sub")
+        assert brain._tools.has("metacognition_report")
 
 
 class TestEmotionBrain:

@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from chat_core.config import get_config
 from chat_core.core.provider import ModelProvider
@@ -17,6 +20,8 @@ from chat_core.core.types import (
     LOGIC_BRAIN_CHAIN_CONFIG,
     MemoryEntry,
     Message,
+    MetacognitionReport,
+    MetaParamOverrides,
     NonStreamResult,
     RelationType,
     ToolCall,
@@ -134,6 +139,55 @@ class LogicBrain:
             fn=lambda args, ctx: json.dumps({"injected": True}),
             parallel_safe=False,
         ))
+        # Spec 006: 元认知报告工具
+        self._tools.register(ToolDefinition(
+            name="metacognition_report",
+            description="提交元认知审查结论：文本洞察 + 可选参数调节",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "insight_text": {
+                        "type": "string",
+                        "description": "自然语言自我洞察",
+                    },
+                    "param_overrides": {
+                        "type": "object",
+                        "properties": {
+                            "review_threshold_offset": {
+                                "type": "number",
+                                "description": "审查阈值偏移，范围 ±0.15",
+                            },
+                            "defense_prob_multiplier": {
+                                "type": "number",
+                                "description": "防御概率乘数，范围 0.5~2.0",
+                            },
+                            "interest_modulations": {
+                                "type": "object",
+                                "description": "话题兴趣调制，{topic_name: ±0.3}",
+                            },
+                            "emotion_threshold_offset": {
+                                "type": "number",
+                                "description": "情绪交互阈值偏移，范围 ±0.1",
+                            },
+                            "inner_thoughts_mode": {
+                                "type": "string",
+                                "enum": ["full", "brief", "minimal"],
+                                "description": "内心戏详细度",
+                            },
+                        },
+                    },
+                    "confidence": {
+                        "type": "number",
+                        "description": "确定度 0~1",
+                        "minimum": 0,
+                        "maximum": 1,
+                    },
+                },
+                "required": ["insight_text", "confidence"],
+            },
+            fn=lambda args, ctx: json.dumps({"report_submitted": True}),
+            parallel_safe=False,
+        ))
 
     # ── Phase 1: recall + 初步判断 ─────────────────────────
 
@@ -197,6 +251,7 @@ class LogicBrain:
             role="assistant",
             content=result.content,
             tool_calls=result.tool_calls if result.tool_calls else None,
+            reasoning_content=result.reasoning_content,
         ))
         # 追加 tool 结果到历史（OpenAI API 要求）
         self._history.extend(tool_results)
@@ -267,6 +322,7 @@ class LogicBrain:
             role="assistant",
             content=result.content,
             tool_calls=result.tool_calls if result.tool_calls else None,
+            reasoning_content=result.reasoning_content,
         ))
         self._history.extend(tool_inject_results)
 
@@ -376,6 +432,89 @@ class LogicBrain:
             await self._do_memory_link(args)
         except Exception:
             pass
+
+
+    # ── Spec 006: 元认知 pass ───────────────────────────────
+
+    async def metacognition_pass(self, context: str) -> "MetacognitionReport | None":
+        """执行元认知审视：单次 LLM 调用，返回 MetacognitionReport。
+
+        复用 LogicBrain 的 DeepSeek Pro，使用 metacognition_report 工具。
+        失败时返回 None（静默降级，不阻塞 turn）。
+        """
+        prompt = (
+            "[元认知审查] 请审视你最近的行为模式:\n\n"
+            f"{context}\n\n"
+            "请调用 metacognition_report 工具提交你的审查结论。"
+        )
+
+        messages = [Message(role="user", content=prompt)]
+
+        cfg = get_config()
+        api_cfg = cfg.brain_api_config("logic")
+
+        try:
+            result = await self._provider.chat(
+                messages=messages,
+                model=api_cfg.get("model", "deepseek-v4-pro"),
+                tools=self._tools.specs(),
+                temperature=api_cfg.get("temperature", 0.3),
+                max_tokens=api_cfg.get("max_tokens", 1024),
+                reasoning_effort=api_cfg.get("reasoning_effort", "max"),
+            )
+
+            # 解析 tool_calls → MetacognitionReport
+            if result.tool_calls:
+                for tc in result.tool_calls:
+                    if tc.function_name == "metacognition_report":
+                        try:
+                            args = json.loads(tc.function_args)
+                            insight_text = str(args.get("insight_text", ""))
+                            confidence = float(args.get("confidence", 0.0))
+
+                            overrides_raw = args.get("param_overrides", {}) or {}
+                            param_overrides = MetaParamOverrides()
+                            # 仅当 LLM 显式返回该字段时才设置值 + sentinel
+                            if "review_threshold_offset" in overrides_raw:
+                                param_overrides.review_threshold_offset = float(overrides_raw.get("review_threshold_offset", 0.0))
+                                param_overrides._review_threshold_set = True
+                            if "defense_prob_multiplier" in overrides_raw:
+                                param_overrides.defense_prob_multiplier = float(overrides_raw.get("defense_prob_multiplier", 1.0))
+                                param_overrides._defense_prob_set = True
+                            if "interest_modulations" in overrides_raw:
+                                param_overrides.interest_modulations = dict(overrides_raw.get("interest_modulations", {}))
+                            if "emotion_threshold_offset" in overrides_raw:
+                                param_overrides.emotion_threshold_offset = float(overrides_raw.get("emotion_threshold_offset", 0.0))
+                                param_overrides._emotion_threshold_set = True
+                            if "inner_thoughts_mode" in overrides_raw:
+                                param_overrides.inner_thoughts_mode = str(overrides_raw.get("inner_thoughts_mode", "full"))
+                                param_overrides._inner_thoughts_set = True
+
+                            return MetacognitionReport(
+                                insight_text=insight_text,
+                                confidence=confidence,
+                                param_overrides=param_overrides,
+                            )
+                        except (json.JSONDecodeError, ValueError, TypeError) as e:
+                            logger.warning(f"Failed to parse metacognition_report: {e}")
+
+            # 降级：从 content 中尝试提取
+            if result.content:
+                try:
+                    content_json = json.loads(result.content)
+                    if "insight_text" in content_json:
+                        return MetacognitionReport(
+                            insight_text=str(content_json.get("insight_text", "")),
+                            confidence=float(content_json.get("confidence", 0.0)),
+                        )
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+            return None
+
+        except Exception as e:
+            logger.warning(f"Metacognition pass failed: {e}")
+            return None
 
 
 # ── 情感主脑 ──────────────────────────────────────────────
@@ -508,6 +647,7 @@ class EmotionBrain:
             role="assistant",
             content=result.content,
             tool_calls=result.tool_calls if result.tool_calls else None,
+            reasoning_content=result.reasoning_content,
         ))
         self._history.extend(tool_results)
 
@@ -560,6 +700,7 @@ class EmotionBrain:
             role="assistant",
             content=result.content,
             tool_calls=result.tool_calls if result.tool_calls else None,
+            reasoning_content=result.reasoning_content,
         ))
         self._history.extend(tool_inject_results)
 
